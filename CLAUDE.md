@@ -3,8 +3,12 @@
 College AI mini project (viva-defended): a front-end-only dynamic flood evacuation planner.
 Full original brief: `flood-evacuation-claude-code-prompt.md` (the source of truth if anything here is ambiguous).
 
+## Current status (read first)
+Phases 1-4 are done and pushed (plus the Mumbai/light-theme scope change). **Next: phase 5 (Bayesian network).**
+`HANDOFF.md` has the full state, the architecture as built, gotchas, and the detailed plan for phases 5-10. Read it before starting.
+
 ## Hard rules
-- **Never** run `git init/add/commit/push`, deploy commands, or create remotes/accounts/hosting. The user commits and deploys. At the end of a phase, suggest a commit message.
+- **Never** run any git command that modifies the repo (`git init/add/commit/push/checkout/reset/stash`...), deploy commands, or create remotes/accounts/hosting. The user commits and pushes. At the end of a phase, give a commit message and the three commands (`git add .`, `git commit -m "..."`, `git push`), each in its own code block.
 - Work **phase by phase** (below). After each phase: `npm run build` must pass and `npm run dev` must start. Then stop and summarise in 3-5 lines (what works, what to look at, commit message, what's next).
 - Minimal testing: only the small Vitest checks (A* cost == UCS cost, enumeration == variable elimination, CSP map-colouring solve + infeasible detection, flood mass conservation). No Playwright, Lighthouse or screenshot loops.
 - Ask once, in a batch, if something essential is unclear. Ask before adding any extra hue.
