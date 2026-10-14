@@ -4,8 +4,8 @@ College AI mini project (viva-defended): a front-end-only dynamic flood evacuati
 Full original brief: `flood-evacuation-claude-code-prompt.md` (the source of truth if anything here is ambiguous).
 
 ## Current status (read first)
-Phases 1-4 are done and pushed (plus the Mumbai/light-theme scope change). **Next: phase 5 (Bayesian network).**
-`HANDOFF.md` has the full state, the architecture as built, gotchas, and the detailed plan for phases 5-10. Read it before starting.
+Phases 1-5 are done (plus the Mumbai/light-theme scope change). **Next: phase 6 (CSP + SA/HC, Assignment page).**
+`HANDOFF.md` has the full state, the architecture as built, gotchas, and the detailed plan for phases 6-10. Read it before starting.
 
 ## Hard rules
 - **Never** run any git command that modifies the repo (`git init/add/commit/push/checkout/reset/stash`...), deploy commands, or create remotes/accounts/hosting. The user commits and pushes. At the end of a phase, give a commit message and the three commands (`git add .`, `git commit -m "..."`, `git push`), each in its own code block.

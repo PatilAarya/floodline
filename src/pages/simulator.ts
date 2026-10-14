@@ -10,17 +10,20 @@
  *             rises or recedes immediately across connected low ground.
  * Either way, roads close and reopen as the water moves.
  */
+import { mumbaiNetwork, RAIN_STATES, RIVER_STATES, riverClass } from '../ai/bayes/cpt';
 import { prefs, setQuality, type Quality } from '../core/prefs';
 import { randomSeedString } from '../core/rng';
 import { replaceParams, type Page } from '../core/router';
 import { clamp, fmtClock, fmtInt, fmtMinutes, fmtNum, parseClamped, sanitizeSeed } from '../core/units';
 import { AgentLayer } from '../render/canvas/agents';
+import { hatchAlpha, hatchSpacing, RiskLayer } from '../render/canvas/risk';
 import { Status, type AgentMetrics, type Strategy } from '../sim/agents';
 import { buildAgentSetup } from '../sim/agentSetup';
-import { pickGaugeCell, type FrameMsg } from '../sim/floodEngine';
+import { pickGaugeCell, type FrameMsg, type RiskFrame } from '../sim/floodEngine';
 import { FloodClient } from '../sim/floodClient';
 import { buildEdgeTable, buildFloodSetup, buildForcing, computeEdgeStates, floodStats, waterLevelFlood, type EdgeTable, type TravelMode } from '../sim/hydrology';
 import { rainSeries, totalRain } from '../sim/rainfall';
+import { buildRiskSetup, hoodRisk, riskPosterior, type RiskSetup } from '../sim/riskModel';
 import { resolveStorm, SCENARIO_IDS, SCENARIOS, scenarioFromURL, scenarioToURL, type ScenarioId, type ScenarioParams } from '../sim/scenario';
 import { createScrubber } from '../ui/controls/scrubber';
 import { createSegmented } from '../ui/controls/segmented';
@@ -53,7 +56,18 @@ const LEGEND_SVG: Record<string, string> = {
   gStuck: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="6.4" fill="none" stroke="var(--text)" stroke-width="1.2" stroke-dasharray="2 2"/><circle cx="21" cy="7" r="4" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.3"/><circle cx="21" cy="7" r="2" fill="var(--text)"/></svg>`,
   gStranded: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.4"/><path d="M18.8 4.8l4.4 4.4M23.2 4.8l-4.4 4.4" stroke="var(--text)" stroke-width="1.5"/></svg>`,
   route: `<svg viewBox="0 0 42 14"><path d="M2 10c10 0 12-6 20-6s12 4 18 4" fill="none" stroke="color-mix(in oklab, var(--primary) 80%, var(--text))" stroke-width="2.4" stroke-linecap="round"/></svg>`,
+  riskLow: riskSwatch(0.15),
+  riskMid: riskSwatch(0.5),
+  riskHigh: riskSwatch(0.9),
 };
+
+/** Legend swatch with the same hatch spacing the map uses for probability p. */
+function riskSwatch(p: number): string {
+  const sp = hatchSpacing(p).toFixed(1);
+  const id = `lg-r${Math.round(p * 100)}`;
+  const edge = p >= 2 / 3 ? `stroke="var(--text)" stroke-opacity=".55" stroke-width="1.4"` : `stroke="var(--text)" stroke-opacity=".28" stroke-dasharray="2 3"`;
+  return `<svg viewBox="0 0 42 14"><defs><pattern id="${id}" width="${sp}" height="${sp}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><path d="M0 0v${sp}" stroke="var(--text)" stroke-opacity="${hatchAlpha(p).toFixed(2)}" stroke-width="1"/></pattern></defs><rect x="2" y="1" width="38" height="12" fill="url(#${id})" ${edge}/></svg>`;
+}
 
 const page: Page = {
   title: 'Simulator',
@@ -67,6 +81,14 @@ const page: Page = {
     const strategyParam = query.get('strategy');
     let strategy: Strategy = strategyParam === 'naive' || strategyParam === 'risk' ? strategyParam : 'dynamic';
     const agentLayer = new AgentLayer();
+    const riskLayer = new RiskLayer();
+    const net = mumbaiNetwork();
+    let riskSetup: RiskSetup | null = null;
+    let lastRisk: RiskFrame | null = null;
+    /** Per hood P(FloodRisk = low, medium, high), whichever mode produced it. */
+    let hoodDist: Float32Array | null = null;
+    let showRisk = true;
+    let currentSel: Selection = null;
     let selectedGroup = -1;
     let frameAt = 0;
     let frameInterval = 1000;
@@ -96,10 +118,12 @@ const page: Page = {
       label: 'Flood map of the Mithi River basin, Mumbai',
       onSelect: (sel) => {
         selectedGroup = sel?.kind === 'group' ? sel.id : -1;
+        currentSel = sel;
         showInspector(sel);
         if (sel) sheet.reveal(inspector);
       },
       drawExtra: (d) => {
+        if (showRisk && world) riskLayer.draw(d, world);
         if (mode === 'storm' && showAgents && world) agentLayer.draw(d, world, interp(), selectedGroup);
       },
       hitExtra: (sx, sy) => {
@@ -127,7 +151,7 @@ const page: Page = {
       options: [
         { value: 'naive', label: 'Naive static', hint: 'Plan once on the dry map; never re-plan; wait at closed roads' },
         { value: 'dynamic', label: 'Dynamic A*', hint: 'A* on live road states, re-plans when roads close' },
-        { value: 'risk', label: 'Risk-aware A*', hint: 'Dynamic A* that also avoids roads at risk of flooding' },
+        { value: 'risk', label: 'Risk-aware A*', hint: 'Dynamic A* that also avoids roads the Bayesian network rates likely to flood' },
       ],
       onChange: (st) => {
         strategy = st;
@@ -351,6 +375,7 @@ const page: Page = {
       },
     });
     const agentToggles = [
+      createToggle({ label: 'Flood risk hatching (Bayes)', value: true, onChange: (v) => { showRisk = v; map.requestRender(); } }).el,
       createToggle({ label: 'Evacuee groups', value: true, onChange: (v) => { showAgents = v; map.requestRender(); } }).el,
       createToggle({ label: 'Planned routes', value: true, onChange: (v) => { agentLayer.showRoutes = v; map.requestRender(); } }).el,
     ];
@@ -379,6 +404,9 @@ const page: Page = {
           ['gStuck', 'Group stuck at a closed road'],
           ['gStranded', 'Group with no reachable centre'],
           ['route', 'Planned route'],
+          ['riskLow', 'Flood risk: P(high) about 15%'],
+          ['riskMid', 'Flood risk: about 50%'],
+          ['riskHigh', 'Flood risk: about 90% (heavy edge above 2 in 3)'],
         ] as [string, string][]).map(([k, label]) => h('li', null, h('span', { html: LEGEND_SVG[k], 'aria-hidden': 'true' }), label)),
       ),
     );
@@ -410,6 +438,8 @@ const page: Page = {
         applyLevel();
       } else if (lastFrame) {
         // Back to the simulation: show its current state again.
+        lastRisk = null;
+        setHoodDist(lastFrame.risk?.hood ?? null);
         client?.send({ type: 'seek', minute });
       }
       syncURL();
@@ -466,6 +496,28 @@ const page: Page = {
           ['Drains working at', `${Math.round((stats.drainEff ?? 1) * 100)}%`],
           ['Water balance error', (stats.massError ?? 0).toExponential(1)],
         );
+      }
+      const r = mode === 'storm' ? lastRisk : null;
+      if (r) {
+        const rd = r.readings;
+        rows.push(
+          ['Rain gauge reads', `${RAIN_STATES[rd.rain]}${rd.rain !== rd.rainTrue ? ' (misread)' : ''}`],
+          ['River gauge reads', `${RIVER_STATES[rd.river]}${rd.river !== rd.riverTrue ? ' (misread)' : ''}`],
+          ['P(heavy rain | gauges)', fmtNum(r.pRain[2], 2)],
+          ['P(river high | gauges)', fmtNum(r.pRiver[2], 2)],
+        );
+      }
+      if (hoodDist && world) {
+        let worst = 0, worstP = -1, over = 0;
+        for (let i = 0; i < world.hoods.length; i++) {
+          const ph = hoodDist[i * 3 + 2];
+          if (ph >= 0.5) over += world.hoods[i].population;
+          if (world.hoods[i].population > 0 && ph > worstP) {
+            worstP = ph;
+            worst = i;
+          }
+        }
+        rows.push(['Highest flood risk', `${world.hoods[worst].name}, ${fmtNum(worstP, 2)}`], ['Demand in areas at 50%+ risk', fmtInt(over)]);
       }
       liveFacts.replaceChildren(...rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
       map.setSummary(`${mode === 'storm' ? `At ${fmtClock(minute)}` : `Water at ${level.toFixed(1)} m`}: ${fmtNum(stats.floodedKm2, 1)} square kilometres flooded, ${stats.blocked} road segments closed, rain ${Math.round(stats.rain)} mm per hour.`);
@@ -547,6 +599,7 @@ const page: Page = {
       if (f.metrics) updateEvacuation(f.metrics, f.minute, jump, f.agents);
       map.setEdgeState(f.edgeState);
       map.setRain(clamp(f.stats.rain / 120, 0, 1));
+      applyRiskFrame(f.risk, jump, prev?.risk ?? null);
       scrubber.set(f.minute);
       scrubber.setBuffered(f.computed / duration);
       updateFigures(f.stats);
@@ -561,6 +614,45 @@ const page: Page = {
       lagNote.textContent = f.lagging ? 'This device cannot keep up with this speed; the simulation is running as fast as it can.' : '';
       status.hidden = true;
       requestAnimationFrame(() => client?.send({ type: 'ack' }));
+    }
+
+    function setHoodDist(dist: Float32Array | null) {
+      hoodDist = dist;
+      if (!dist) {
+        riskLayer.setRisk(null);
+        return;
+      }
+      const ph = new Float32Array(dist.length / 3);
+      for (let i = 0; i < ph.length; i++) ph[i] = dist[i * 3 + 2];
+      riskLayer.setRisk(ph);
+      map.requestRender();
+    }
+
+    /** New Bayesian posterior from the engine: overlay, events, live inspector. */
+    function applyRiskFrame(r: RiskFrame | null, jump: boolean, prev: RiskFrame | null) {
+      lastRisk = r;
+      if (!r) return;
+      const fresh = !prev || jump || prev.readings.minute !== r.readings.minute;
+      if (!fresh) return;
+      const before = hoodDist;
+      setHoodDist(r.hood);
+      const w = world;
+      if (w && !jump && prev) {
+        const rd = r.readings, when = fmtClock(rd.minute);
+        if (rd.rain !== rd.rainTrue) log(`Rain gauge misread at ${when}: it reported ${RAIN_STATES[rd.rain]} rain, the truth was ${RAIN_STATES[rd.rainTrue]}. The network weighs it against the river gauge.`);
+        if (rd.river !== rd.riverTrue) log(`River gauge misread at ${when}: it reported ${RIVER_STATES[rd.river]}, the river was ${RIVER_STATES[rd.riverTrue]}.`);
+        if (before) {
+          const up: string[] = [], down: string[] = [];
+          for (let i = 0; i < w.hoods.length; i++) {
+            const a = before[i * 3 + 2], b = r.hood[i * 3 + 2];
+            if (a < 0.5 && b >= 0.5) up.push(w.hoods[i].name);
+            else if (a >= 0.5 && b < 0.5) down.push(w.hoods[i].name);
+          }
+          if (up.length) log(`Flood risk rose above 50% at ${when} in ${listOf(up)}.`);
+          if (down.length) log(`Flood risk fell below 50% at ${when} in ${listOf(down)}.`);
+        }
+      }
+      if (currentSel && (currentSel.kind === 'hood' || currentSel.kind === 'edge')) showInspector(currentSel, false);
     }
 
     function setPlaying(p: boolean) {
@@ -589,6 +681,13 @@ const page: Page = {
       map.setDepth(depth, new Float32Array(depth.length * 2), { reset: true, intervalMs: 0 });
       map.setEdgeState(st);
       map.setRain(0);
+      // The network in "what if" mode: no rain reading, and the river gauge
+      // reads the standing water level (no sensor noise).
+      if (riskSetup) {
+        const rs = riskSetup;
+        const river = riverClass(Math.max(level, rs.gaugeBed + 0.6), rs.gaugeBed, rs.gaugeBank);
+        setHoodDist(hoodRisk(rs, riskPosterior(net, -1, river)));
+      }
       const fs = floodStats(w, depth);
       updateFigures({ rain: 0, floodedKm2: fs.floodedKm2, blocked: es.blocked, degraded: es.degraded, maxDepth: fs.maxDepth });
     }
@@ -636,7 +735,10 @@ const page: Page = {
       selectedGroup = -1;
       lastReplans = 0;
       announcedDone = false;
-      c.send({ type: 'init', setup, forcing: buildForcing(sp), edges: table!, ground: w.ground, gaugeCell: pickGaugeCell(w), mode: travel, notLand, agents: buildAgentSetup(w, strategy, travel) });
+      const gaugeCell = pickGaugeCell(w);
+      riskSetup = buildRiskSetup(w, sp.seed, gaugeCell);
+      lastRisk = null;
+      c.send({ type: 'init', setup, forcing: buildForcing(sp), edges: table!, ground: w.ground, gaugeCell, mode: travel, notLand, agents: buildAgentSetup(w, strategy, travel), risk: riskSetup });
       if (sp.rainScale !== 1) c.send({ type: 'rain', scale: sp.rainScale });
       renderStormInfo();
     }
@@ -693,7 +795,7 @@ const page: Page = {
       );
     }
 
-    function showInspector(sel: Selection) {
+    function showInspector(sel: Selection, speak = true) {
       const w = world;
       if (!w || !sel) {
         inspectorBody.replaceChildren(h('p', { class: 'small muted' }, 'Tap a neighbourhood, road, bridge, subway or relief centre on the map.'));
@@ -712,6 +814,15 @@ const page: Page = {
           ['Pick-up junction', hd.accessNode >= 0 ? `J${hd.accessNode}` : 'no road access'],
           ['Facilities', [hd.hasHospital ? 'hospital' : '', hd.hasSchool ? 'school' : ''].filter(Boolean).join(', ') || 'none mapped'],
         );
+        if (hoodDist) {
+          const o = sel.id * 3;
+          const evid = mode === 'storm' && lastRisk ? `, rain gauge ${RAIN_STATES[lastRisk.readings.rain]}, river gauge ${RIVER_STATES[lastRisk.readings.river]}` : mode === 'level' ? `, water at ${level.toFixed(1)} m` : '';
+          rows.push(
+            ['Flood risk, Bayes', `P(high) ${fmtNum(hoodDist[o + 2], 2)}`],
+            ['Low / medium / high', `${fmtNum(hoodDist[o], 2)} / ${fmtNum(hoodDist[o + 1], 2)} / ${fmtNum(hoodDist[o + 2], 2)}`],
+            ['Evidence', `${hd.drainageClass} drains, ${hd.meanElev < 5 ? 'low' : hd.meanElev < 9 ? 'mid' : 'high'} ground${evid}`],
+          );
+        }
       } else if (sel.kind === 'group') {
         const gr = agentLayer.group(sel.id);
         title = `Evacuee group ${sel.id + 1}`;
@@ -738,9 +849,10 @@ const page: Page = {
           ['Lowest point', e.kind === 'flyover' ? 'elevated' : `${fmtNum(e.minElev, 1)} m`],
         );
         if (e.isBridge) rows.push(['Deck level', `${fmtNum(e.deckLevel, 1)} m`]);
+        if (mode === 'storm' && lastFrame?.risk) rows.push(['Flood risk P_flood', e.kind === 'flyover' ? '0 (elevated)' : fmtNum(lastFrame.edgeRisk[e.id] ?? 0, 2)]);
       }
       inspectorBody.replaceChildren(h('h3', { style: 'font-size: var(--step-1); margin-bottom: var(--s-3)' }, title), h('dl', { class: 'facts' }, ...rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])));
-      announce(`Selected ${title}`);
+      if (speak) announce(`Selected ${title}`);
     }
 
     // ── Wiring ──

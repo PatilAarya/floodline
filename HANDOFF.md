@@ -28,8 +28,8 @@ The original brief is `flood-evacuation-claude-code-prompt.md`.
 | (scope change) Real Mumbai map, light theme only, water-level slider | done |
 | 3 Flood sim + WebGL | done |
 | 4 Search + agents + re-planner + Algorithms race | done |
-| **5 Bayesian network** | **next** |
-| 6 CSP + SA/HC (Assignment page) | todo |
+| 5 Bayesian network | done |
+| **6 CSP + SA/HC (Assignment page)** | **next** |
 | 7 Simulator integration | todo (much already exists, see section 4) |
 | 8 Experiments | todo |
 | 9 Home narrative, Viva page, polish, docs | todo |
@@ -37,8 +37,7 @@ The original brief is `flood-evacuation-claude-code-prompt.md`.
 
 Current numbers (26 July 2005 storm, default seed `mumbai`, 128 grid, vehicles):
 naive static 298,600 sheltered / 112,400 stuck, mean trip 122 min, p95 497;
-dynamic A* 406,000 sheltered, mean 38, p95 108; risk-aware A* 406,000, mean 37, p95 81.
-(Risk-aware currently uses a depth-based risk proxy; phase 5 replaces it with the BN posterior.)
+dynamic A* 406,000 sheltered, mean 38, p95 108; risk-aware A* (BN posterior) 406,000, mean 38, p95 73.
 
 ---
 
@@ -47,7 +46,7 @@ dynamic A* 406,000 sheltered, mean 38, p95 108; risk-aware A* 406,000, mean 37, 
 ```
 npm i
 npm run dev          # http://localhost:5173 (also .claude/launch.json "floodline-dev")
-npx vitest run       # 15 tests, ~4 s
+npx vitest run       # 20 tests, ~4 s
 npm run build        # tsc --noEmit && vite build -> dist/
 npm run fetch:mumbai # re-download raw OSM + SRTM (only if needed; slow, rate-limited)
 npm run build:mumbai # rebuild src/data/mumbai.json from scripts/.cache
@@ -77,7 +76,10 @@ Versions installed: Vite 8, TypeScript 7, Vitest 5, Node 22. Windows machine (Po
 - `hydrology.ts`: `buildFloodSetup(world)` (drain capacity 25 mm/h x quality, infiltration, roughness, channels start at 0.6 m, lakes full), `buildForcing(params)`, `EdgeTable` + `computeEdgeStates()` (0 open / 1 degraded / 2 blocked; vehicle 0.15/0.30 m, foot 0.25/0.50 m), `speedFactor()`, `waterLevelFlood(world, L)` (instant connected "bathtub" fill from sea + channels), `floodStats()`. Drain efficiency drops with tide (outfall flap gates).
 - `floodEngine.ts`: playback loop, keyframes every 30 min (flood + agents), seek, live rain override (truncates the future), `forcing`/`mode`/`strategy` changes recompute from minute 0, frame backpressure (`ack`), frames carry depth, flow, edge states/depths, stats, agent positions and metrics; `routes` messages carry changed routes. `floodWorker.ts` hosts it; `floodClient.ts` wraps the worker (falls back to main thread, reports crashes, HMR cleanup).
 - `agents.ts`: `AgentSim` (groups: waiting, moving, sheltered, stranded, stuck, recovering, no-access). Strategies `naive | dynamic | risk`. `agentSetup.ts`: `buildNet()` (MONSOON_TRAFFIC 0.35 on vehicle speeds), `buildGroups()` (warning t+45, boarding 15 min, staggered departures lowest areas first), `buildAgentSetup(world, strategy, mode, lambda=2)`.
-- Risk input to the agents is currently `riskFromDepth()` in `floodEngine.updateRoads()`: **phase 5 should replace this with the BN posterior per edge.**
+- Risk input to the agents: `floodEngine.updateRoads()` uses `src/sim/riskModel.ts` when `InitMsg.risk` is set (the Simulator always sets it): every `READ_EVERY` = 10 min the rain and river gauges report (truth discretised, then a misread drawn from the sensor CPT row with `Rng(seed::gauge::name::minute)`, so rewinds replay identically), VE gives P(FloodRisk | gauges, Drainage, Elevation) for the 9 (d, e) combos, hoods/edges look up their row; edge P_flood = noisy-OR(BN P(high), depth / blocking depth), flyovers 0, subways count as low ground. Frames carry `risk` (readings, P(Rain), P(River), per-hood 3-way dist) and `edgeRisk`. `riskFromDepth` remains the fallback (Algorithms page).
+
+### Bayesian network (`src/ai/bayes/`)
+`network.ts` (types, CPT layout: first parent most significant, `validate` rows sum to 1 within 1e-9, `topoOrder`), `cpt.ts` (`mumbaiNetwork()`, `V` indices, thresholds: rain 25/60 mm/h, river 0.3/0.6 of bed-to-bank at the gauge, elevation 5/9 m; FloodRisk rows from an ordered-logistic score `RISK_WEIGHTS`), `exact.ts` (enumeration, VE with barren pruning + min-neighbours order + factor rescaling, impossible evidence -> `{impossible: true}`), `sampling.ts` (likelihood weighting with log checkpoints + ESS), `dsep.ts` (Bayes-ball + trail enumeration with reasons). `pages/bayes.ts`: SVG network (click state = evidence, keys 1-3/0), enumeration vs VE table, LW convergence plot (5 seeded runs x 100k), d-separation explainer with numerical check, editable CPTs with hatched invalid rows, scene + neighbourhood evidence presets, evidence in the URL (`?ev=RainGauge.heavy,...`). Simulator: "Flood risk hatching (Bayes)" layer (`src/render/canvas/risk.ts`, density = P(high), cached offscreen), Now figures (gauge readings, misreads), inspector rows, events for misreads and 50% crossings; Water-level mode runs the BN with the river reading from the level.
 
 ### Search (`src/ai/search/`)
 `types.ts` (SearchGraph CSR, SearchProblem, events `expand|frontier|goal|fail`, counters), `bfs.ts`, `dfs.ts`, `ucs.ts` (Dijkstra, lazy deletion, `COST_EPS`), `greedy.ts`, `astar.ts` (reopen-on-improvement, tie-break towards larger g), `cost.ts` (`makeCost`, `makeCostFromArrays`, `makeHeuristic(g, goal, vmax, inflate)`, `maxSpeed`, `riskFromDepth`, `DEGRADED_PENALTY` 300 s), `replanner.ts` (MARGIN 0.12, MIN_INTERVAL 10 min, PERIODIC_EVERY 20, mid-edge push-on rule, `nearestShelter` multi-goal UCS with capacity + taboo, `routeTo` via A*).
@@ -96,7 +98,7 @@ Versions installed: Vite 8, TypeScript 7, Vitest 5, Node 22. Windows machine (Po
 - `pages/home.ts` (simple hero + 4 chapters; phase 9 adds the scroll narrative), `pages/kit.ts` (unlisted `#/kit`), placeholders: `bayes.ts`, `assignment.ts`, `experiments.ts`, `viva.ts` (use `pageHead()` / `comingInPhase()` from `_shared.ts`).
 
 ### Tests (`tests/`)
-`world.test.ts` (synthetic connectivity/determinism), `flood.test.ts` (mass conservation x2, rewind determinism), `search.test.ts` (A* == UCS dry and flooded on Mumbai, admissible + consistent heuristic, BFS/DFS/Greedy never cheaper, clean failure). Tests read `src/data/mumbai.json` with `fs`.
+`world.test.ts` (synthetic connectivity/determinism), `flood.test.ts` (mass conservation x2, rewind determinism), `bayes.test.ts` (CPTs valid, enumeration == VE to 1e-9 on 7 evidence sets, impossible evidence, LW within 0.02 at 50k, d-separation cases + Bayes-ball == trail enumeration), `search.test.ts` (A* == UCS dry and flooded on Mumbai, admissible + consistent heuristic, BFS/DFS/Greedy never cheaper, clean failure). Tests read `src/data/mumbai.json` with `fs`.
 
 ---
 

@@ -22,10 +22,13 @@
  *   Tide, drains, travel mode, strategy: these apply from the start, so the
  *   run is recomputed from minute 0 up to the current minute.
  */
+import { mumbaiNetwork } from '../ai/bayes/cpt';
+import type { Network } from '../ai/bayes/network';
 import { riskFromDepth } from '../ai/search/cost';
 import { AgentSim, type AgentMetrics, type AgentSetup, type AgentSnapshot, type Strategy } from './agents';
 import { computeEdgeStates, type EdgeTable, type TravelMode } from './hydrology';
 import { FloodModel, type FloodSetup, type FloodState, type Forcing } from './floodModel';
+import { edgeRisk, hoodRisk, READ_EVERY, readGauges, riskPosterior, type RiskPosterior, type RiskReadings, type RiskSetup } from './riskModel';
 import type { World } from '../world/types';
 
 export const KEY_EVERY = 30;
@@ -41,6 +44,8 @@ export interface InitMsg {
   /** For flood stats: sea + channel mask (1 = not land). */
   notLand: Uint8Array;
   agents?: AgentSetup;
+  /** Bayesian-network flood risk inputs. Without it, road risk falls back to a depth proxy. */
+  risk?: RiskSetup;
 }
 
 export type InMsg =
@@ -72,6 +77,16 @@ export interface FrameStats {
   substeps: number;
 }
 
+/** What the Bayesian network currently believes (sent with every frame). */
+export interface RiskFrame {
+  readings: RiskReadings;
+  /** P(Rain | gauges), P(RiverLevel | gauges): low/light .. high/heavy. */
+  pRain: number[];
+  pRiver: number[];
+  /** Per neighbourhood: P(FloodRisk = low, medium, high), 3 numbers each. */
+  hood: Float32Array;
+}
+
 export interface FrameMsg {
   type: 'frame';
   minute: number;
@@ -83,6 +98,10 @@ export interface FrameMsg {
   /** [x, y, status, size, shelter, replans] per group, if agents are on. */
   agents: Float32Array | null;
   metrics: AgentMetrics | null;
+  /** Bayesian risk, if the risk model is on. */
+  risk: RiskFrame | null;
+  /** P_flood per road segment (BN + water on the road), fed to risk-aware A*. */
+  edgeRisk: Float32Array;
   computed: number;
   playing: boolean;
   lagging: boolean;
@@ -131,6 +150,9 @@ export class FloodEngine {
   private edgeState!: Uint8Array;
   private edgeDepth!: Float32Array;
   private risk!: Float32Array;
+  private net: Network = mumbaiNetwork();
+  private readings: RiskReadings | null = null;
+  private posterior: RiskPosterior | null = null;
   /** River stage and flooded area per minute, for the hydrograph. */
   private stage: number[] = [];
   private flooded: number[] = [];
@@ -227,6 +249,8 @@ export class FloodEngine {
   private resetHistory(): void {
     const m = this.model!;
     this.keyframes.clear();
+    this.readings = null;
+    this.posterior = null;
     m.reset();
     this.agents?.reset();
     this.updateRoads();
@@ -291,11 +315,29 @@ export class FloodEngine {
     }
   };
 
-  /** Road states (and the risk proxy) for the current water. */
+  /**
+   * Road states for the current water, then road risk. With the risk model
+   * on, the gauges report every READ_EVERY minutes and the network's
+   * posterior is updated; road risk combines it with the water on each road.
+   * Readings depend only on (seed, minute, water), and keyframes fall on
+   * multiples of READ_EVERY, so a restored keyframe re-reads the same values.
+   */
   private updateRoads(): void {
     const m = this.model!, init = this.init!;
     computeEdgeStates(init.edges, m.d, init.setup.bed, init.ground, this.mode, this.edgeState, this.edgeDepth);
-    riskFromDepth(this.edgeDepth, this.mode, this.risk);
+    const rs = init.risk;
+    if (!rs) {
+      riskFromDepth(this.edgeDepth, this.mode, this.risk);
+      return;
+    }
+    const t = m.minute;
+    if (!this.posterior || !this.readings || t % READ_EVERY === 0 || t < this.readings.minute) {
+      const g = init.gaugeCell;
+      const stage = g >= 0 ? init.setup.bed[g] + m.d[g] : rs.gaugeBed;
+      this.readings = readGauges(this.net, rs, t, m.rainRate(t) * 1000 * 3600, stage);
+      this.posterior = riskPosterior(this.net, this.readings.rain, this.readings.river);
+    }
+    edgeRisk(rs, this.posterior, this.edgeDepth, this.mode, this.risk);
   }
 
   private stepOne(): void {
@@ -390,6 +432,7 @@ export class FloodEngine {
     const flow = m.flowField();
     const edgeState = this.edgeState.slice();
     const edgeDepth = this.edgeDepth.slice();
+    const edgeRiskOut = this.risk.slice();
     const t = m.minute;
     const fs = statsFor(init, depth);
     const g = init.gaugeCell;
@@ -411,10 +454,15 @@ export class FloodEngine {
     const routes = this.agents?.takeRouteChanges();
     if (routes) this.post({ type: 'routes', ...routes }, [routes.ids.buffer, routes.offsets.buffer, routes.nodes.buffer]);
     const agents: Float32Array | null = this.agents ? this.agents.positions() : null;
-    const transfer: Transferable[] = [depth.buffer, flow.buffer, edgeState.buffer, edgeDepth.buffer];
+    let risk: RiskFrame | null = null;
+    if (init.risk && this.posterior && this.readings) {
+      risk = { readings: { ...this.readings }, pRain: Array.from(this.posterior.pRain), pRiver: Array.from(this.posterior.pRiver), hood: hoodRisk(init.risk, this.posterior) };
+    }
+    const transfer: Transferable[] = [depth.buffer, flow.buffer, edgeState.buffer, edgeDepth.buffer, edgeRiskOut.buffer];
+    if (risk) transfer.push(risk.hood.buffer);
     if (agents) transfer.push(agents.buffer);
     this.post(
-      { type: 'frame', minute: t, depth, flow, edgeState, edgeDepth, stats, agents, metrics: this.agents?.metrics() ?? null, computed: this.computed, playing: this.playing, lagging: this.lagging },
+      { type: 'frame', minute: t, depth, flow, edgeState, edgeDepth, stats, agents, metrics: this.agents?.metrics() ?? null, risk, edgeRisk: edgeRiskOut, computed: this.computed, playing: this.playing, lagging: this.lagging },
       transfer,
     );
   }
