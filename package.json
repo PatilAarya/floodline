@@ -1,0 +1,31 @@
+{
+  "name": "floodline",
+  "version": "1.0.0",
+  "description": "Floodline: a dynamic flood evacuation planner (AI mini project)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "fetch:mumbai": "node scripts/fetch-mumbai.mjs",
+    "build:mumbai": "node scripts/build-mumbai.mjs"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "@types/d3-delaunay": "^6.0.4",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.4"
+  },
+  "dependencies": {
+    "@fontsource/bricolage-grotesque": "^5.3.0",
+    "@fontsource/instrument-sans": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "d3-delaunay": "^6.0.4"
+  },
+  "private": true,
+  "type": "module"
+}

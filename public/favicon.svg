@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <style>
+    .bg { fill: #f9fbfb; }
+    .ink { stroke: #101816; }
+    .water { stroke: #6c998d; }
+  </style>
+  <rect class="bg" width="64" height="64" rx="14" />
+  <!-- open arch: the shelter -->
+  <path class="ink" d="M18 40 V27 a14 14 0 0 1 28 0 V40" fill="none" stroke-width="5" stroke-linecap="round" />
+  <!-- rising water lines -->
+  <path class="water" d="M9 44 q5.75 -5 11.5 0 t11.5 0 t11.5 0 t11.5 0" fill="none" stroke-width="4.5" stroke-linecap="round" />
+  <path class="water" d="M15 53 q4.25 -4 8.5 0 t8.5 0 t8.5 0 t8.5 0" fill="none" stroke-width="3.5" stroke-linecap="round" opacity=".6" />
+</svg>

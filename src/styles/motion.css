@@ -1,0 +1,41 @@
+/* Page transition: a soft water line rises over the page and drains away. */
+.wipe {
+  position: fixed; left: 0; right: 0; top: 0; z-index: 90;
+  height: 100dvh;
+  pointer-events: none;
+  background: color-mix(in oklab, var(--primary) 78%, var(--background));
+  transform: translateY(calc(100% + 40px));
+  will-change: transform;
+}
+.wipe::before, .wipe::after {
+  content: ''; position: absolute; left: 0; right: 0; height: 28px;
+  background: inherit;
+  /* A gentle wave silhouette as a mask, so the colour still comes from tokens. */
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 28' preserveAspectRatio='none'%3E%3Cpath d='M0 14 C 30 2 60 2 90 14 S 150 26 180 14 S 225 4 240 10 V28 H0Z'/%3E%3C/svg%3E") 0 0 / 240px 28px repeat-x;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 28' preserveAspectRatio='none'%3E%3Cpath d='M0 14 C 30 2 60 2 90 14 S 150 26 180 14 S 225 4 240 10 V28 H0Z'/%3E%3C/svg%3E") 0 0 / 240px 28px repeat-x;
+}
+.wipe::before { top: -27px; }
+.wipe::after { bottom: -27px; transform: scaleY(-1); }
+
+/* Page content settles in after a route change. */
+@keyframes settle { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+.page-enter { animation: settle var(--dur-3) var(--ease) both; }
+
+@keyframes pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+.pulse { animation: pulse-soft 1.8s var(--ease-io) infinite; }
+
+@keyframes ripple {
+  from { transform: scale(0.6); opacity: 0.9; }
+  to { transform: scale(1.8); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Decorative motion stops; functional state changes stay instant. */
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .wipe { display: none; }
+}

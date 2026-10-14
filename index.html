@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Floodline: dynamic flood evacuation planner</title>
+    <meta name="description" content="Mumbai's Mithi River basin floods. Floodline estimates risk with a Bayesian network, assigns relief centres with a CSP, improves the plan with simulated annealing, and re-plans routes live with A*." />
+    <meta name="color-scheme" content="light" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <meta property="og:title" content="Floodline" />
+    <meta property="og:description" content="Navigation apps assume the road network is fixed. Floodline handles roads that disappear and risk that is uncertain." />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="./og.png" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header" id="site-header"></header>
+    <main id="main" tabindex="-1"></main>
+    <div id="sr-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+    <div id="wipe" class="wipe" aria-hidden="true"></div>
+    <noscript>
+      <div class="noscript">
+        <h1>Floodline needs JavaScript</h1>
+        <p>This site simulates a flood and runs search, constraint-satisfaction and probabilistic-reasoning algorithms in your browser. Please enable JavaScript to use it. Nothing is sent to a server.</p>
+      </div>
+    </noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

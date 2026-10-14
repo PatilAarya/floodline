@@ -1,0 +1,53 @@
+/*
+ * The only five colours in the project (light theme only). Everything else is
+ * derived with color-mix(in oklab, ...) below, or by src/render/theme.ts for
+ * canvas/WebGL.
+ */
+:root {
+  --text: #101816; --background: #f9fbfb;
+  --primary: #6c998d; --secondary: #a8b1c2; --accent: #8a8ead;
+
+  /* Ink variants are darkened for AA text contrast on the light background. */
+  --primary-ink: color-mix(in oklab, var(--primary) 52%, var(--text));
+  --accent-ink: color-mix(in oklab, var(--accent) 52%, var(--text));
+  --focus: color-mix(in oklab, var(--accent) 85%, var(--text));
+  color-scheme: light;
+}
+:root {
+  /* Derived neutrals */
+  --muted: color-mix(in oklab, var(--text) 66%, var(--background));
+  --faint: color-mix(in oklab, var(--text) 42%, var(--background));
+  --hairline: color-mix(in oklab, var(--text) 13%, transparent);
+  --hairline-strong: color-mix(in oklab, var(--text) 26%, transparent);
+  --wash: color-mix(in oklab, var(--primary) 7%, var(--background));
+  --wash-accent: color-mix(in oklab, var(--accent) 10%, var(--background));
+  --scrim: color-mix(in oklab, var(--background) 86%, transparent);
+  --selection: color-mix(in oklab, var(--primary) 34%, var(--background));
+  --water-deep: color-mix(in oklab, var(--primary) 70%, var(--text));
+
+  /* Type */
+  --font-head: 'Bricolage Grotesque', 'Instrument Sans', system-ui, sans-serif;
+  --font-body: 'Instrument Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Mono', Consolas, monospace;
+
+  --step--1: clamp(0.875rem, 0.85rem + 0.12vw, 0.95rem);
+  --step-0: clamp(1rem, 0.95rem + 0.25vw, 1.125rem);
+  --step-1: clamp(1.2rem, 1.1rem + 0.5vw, 1.45rem);
+  --step-2: clamp(1.5rem, 1.25rem + 1.1vw, 2.1rem);
+  --step-3: clamp(1.9rem, 1.4rem + 2.2vw, 3.2rem);
+  --step-4: clamp(2.6rem, 1.6rem + 4.6vw, 5.6rem);
+  --step-5: clamp(3.2rem, 1.4rem + 8vw, 9.5rem);
+
+  /* Space */
+  --s-1: 0.25rem; --s-2: 0.5rem; --s-3: 0.75rem; --s-4: 1rem;
+  --s-5: 1.5rem; --s-6: 2rem; --s-7: 3rem; --s-8: 4.5rem; --s-9: 7rem;
+  --gutter: clamp(1rem, 0.5rem + 2.5vw, 3rem);
+  --measure: 68ch;
+  --header-h: 3.75rem;
+  --rail-w: clamp(19rem, 16rem + 8vw, 26rem);
+
+  /* Motion: one easing family */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-io: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-1: 200ms; --dur-2: 320ms; --dur-3: 500ms;
+}

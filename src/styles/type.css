@@ -1,0 +1,62 @@
+h1, h2, h3, h4 {
+  font-family: var(--font-head);
+  font-weight: 700;
+  line-height: 1.08;
+  letter-spacing: -0.015em;
+  margin: 0 0 var(--s-4);
+  text-wrap: balance;
+}
+h1 { font-size: var(--step-4); letter-spacing: -0.03em; }
+h2 { font-size: var(--step-3); letter-spacing: -0.025em; }
+h3 { font-size: var(--step-2); }
+h4 { font-size: var(--step-1); }
+
+p { margin: 0 0 var(--s-4); text-wrap: pretty; }
+p, li { max-width: var(--measure); }
+
+.display {
+  font-family: var(--font-head);
+  font-size: var(--step-5);
+  font-weight: 800;
+  line-height: 0.92;
+  letter-spacing: -0.045em;
+}
+
+.lede { font-size: var(--step-1); line-height: 1.5; color: var(--text); max-width: 44ch; }
+.muted { color: var(--muted); }
+.small { font-size: var(--step--1); }
+
+/* Eyebrow labels: small caps-ish, mono for a technical voice. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 var(--s-3);
+}
+
+/* All data is tabular. */
+.num, .mono, code, kbd, samp, pre, table, output, [data-num] {
+  font-variant-numeric: tabular-nums;
+}
+.mono, code, kbd, samp, pre { font-family: var(--font-mono); font-size: 0.92em; }
+
+/* Oversized numerals used instead of stat boxes. */
+.figure {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  font-size: var(--step-4);
+  line-height: 1;
+  letter-spacing: -0.04em;
+}
+.figure-label { font-size: var(--step--1); color: var(--muted); margin-top: var(--s-2); }
+
+pre {
+  overflow-x: auto;
+  padding: var(--s-4) 0;
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+  line-height: 1.55;
+}
