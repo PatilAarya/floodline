@@ -27,7 +27,7 @@ import { css, paletteAnimator, type Palette } from '../render/theme';
 import type { World } from '../world/types';
 import { h } from './dom';
 
-export type Selection = { kind: 'hood' | 'shelter' | 'edge'; id: number } | null;
+export type Selection = { kind: 'hood' | 'shelter' | 'edge' | 'group'; id: number } | null;
 
 export interface Layers {
   terrain: boolean;
@@ -47,6 +47,10 @@ export interface MapViewOptions {
   onSelect?: (sel: Selection) => void;
   /** Extra drawing on the dynamic layer (routes, agents...). */
   drawExtra?: (d: DrawCtx) => void;
+  /** Extra hit-testing (e.g. evacuee groups), checked before roads and areas. */
+  hitExtra?: (sx: number, sy: number) => Selection;
+  /** Raw tap in world coordinates; return true to skip normal selection. */
+  onTap?: (wx: number, wy: number) => boolean;
 }
 
 export interface MapView {
@@ -282,6 +286,8 @@ export function createMapView(o: MapViewOptions): MapView {
 
   const hitTest = (wx: number, wy: number, sx: number, sy: number): Selection => {
     if (!world) return null;
+    const extra = o.hitExtra?.(sx, sy);
+    if (extra) return extra;
     if (layers.shelters) {
       for (const s of world.shelters) {
         const nd = world.graph.nodes[s.node];
@@ -319,6 +325,10 @@ export function createMapView(o: MapViewOptions): MapView {
   const detach = attachCameraControls(dyn, cam, {
     onChange: invalidate,
     onTap(wx, wy, sx, sy) {
+      if (o.onTap?.(wx, wy)) {
+        requestRender();
+        return;
+      }
       selection = hitTest(wx, wy, sx, sy);
       o.onSelect?.(selection);
       invalidate();
@@ -331,6 +341,7 @@ export function createMapView(o: MapViewOptions): MapView {
         invalidate();
       }
       setCursor(hit && hit.kind !== 'hood' ? 'hover' : 'idle');
+      if (hit?.kind === 'group') requestRender();
     },
     onLeave() {
       hover = null;

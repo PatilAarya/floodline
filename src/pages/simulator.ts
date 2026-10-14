@@ -13,7 +13,10 @@
 import { prefs, setQuality, type Quality } from '../core/prefs';
 import { randomSeedString } from '../core/rng';
 import { replaceParams, type Page } from '../core/router';
-import { clamp, fmtClock, fmtInt, fmtNum, parseClamped, sanitizeSeed } from '../core/units';
+import { clamp, fmtClock, fmtInt, fmtMinutes, fmtNum, parseClamped, sanitizeSeed } from '../core/units';
+import { AgentLayer } from '../render/canvas/agents';
+import { Status, type AgentMetrics, type Strategy } from '../sim/agents';
+import { buildAgentSetup } from '../sim/agentSetup';
 import { pickGaugeCell, type FrameMsg } from '../sim/floodEngine';
 import { FloodClient } from '../sim/floodClient';
 import { buildEdgeTable, buildFloodSetup, buildForcing, computeEdgeStates, floodStats, waterLevelFlood, type EdgeTable, type TravelMode } from '../sim/hydrology';
@@ -45,6 +48,11 @@ const LEGEND_SVG: Record<string, string> = {
   water: `<svg viewBox="0 0 42 14"><defs><linearGradient id="lg-w"><stop offset="0" stop-color="color-mix(in oklab, var(--background) 45%, var(--secondary))"/><stop offset=".5" stop-color="color-mix(in oklab, var(--accent) 65%, var(--primary))"/><stop offset="1" stop-color="color-mix(in oklab, var(--primary) 72%, var(--text))"/></linearGradient></defs><rect x="2" y="3" width="38" height="8" rx="2" fill="url(#lg-w)"/></svg>`,
   mangrove: `<svg viewBox="0 0 42 14"><defs><pattern id="lg-m" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r=".8" fill="color-mix(in oklab, var(--primary) 65%, var(--text))"/></pattern></defs><rect x="2" y="2" width="38" height="10" fill="url(#lg-m)" stroke="color-mix(in oklab, var(--primary) 50%, transparent)" stroke-width=".8"/></svg>`,
   shelter: `<svg viewBox="0 0 42 14"><path d="M15.5 13V7.5a5.5 5.5 0 0 1 11 0V13M12 13h18" fill="none" stroke="var(--text)" stroke-width="1.8" stroke-linecap="round"/></svg>`,
+  gMoving: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.4"/><circle cx="21" cy="7" r="2.4" fill="var(--text)"/></svg>`,
+  gWaiting: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="color-mix(in oklab, var(--text) 65%, var(--background))" stroke-width="1.4"/></svg>`,
+  gStuck: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="6.4" fill="none" stroke="var(--text)" stroke-width="1.2" stroke-dasharray="2 2"/><circle cx="21" cy="7" r="4" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.3"/><circle cx="21" cy="7" r="2" fill="var(--text)"/></svg>`,
+  gStranded: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.4"/><path d="M18.8 4.8l4.4 4.4M23.2 4.8l-4.4 4.4" stroke="var(--text)" stroke-width="1.5"/></svg>`,
+  route: `<svg viewBox="0 0 42 14"><path d="M2 10c10 0 12-6 20-6s12 4 18 4" fill="none" stroke="color-mix(in oklab, var(--primary) 80%, var(--text))" stroke-width="2.4" stroke-linecap="round"/></svg>`,
 };
 
 const page: Page = {
@@ -56,6 +64,15 @@ const page: Page = {
     let level = parseClamped(query.get('level'), 2.5, 0, 10);
     let travel: TravelMode = query.get('travel') === 'foot' ? 'foot' : 'vehicle';
     let speed: SpeedStr = '1';
+    const strategyParam = query.get('strategy');
+    let strategy: Strategy = strategyParam === 'naive' || strategyParam === 'risk' ? strategyParam : 'dynamic';
+    const agentLayer = new AgentLayer();
+    let selectedGroup = -1;
+    let frameAt = 0;
+    let frameInterval = 1000;
+    let lastReplans = 0;
+    let announcedDone = false;
+    let showAgents = true;
     let world: World | null = null;
     let table: EdgeTable | null = null;
     let client: FloodClient | null = null;
@@ -74,11 +91,21 @@ const page: Page = {
 
     // ── Map ──
     const status = h('div', { class: 'map-status', role: 'status' }, 'Loading the Mumbai map');
+    const interp = () => clamp((performance.now() - frameAt) / Math.max(16, frameInterval), 0, 1);
     const map = createMapView({
       label: 'Flood map of the Mithi River basin, Mumbai',
       onSelect: (sel) => {
+        selectedGroup = sel?.kind === 'group' ? sel.id : -1;
         showInspector(sel);
         if (sel) sheet.reveal(inspector);
+      },
+      drawExtra: (d) => {
+        if (mode === 'storm' && showAgents && world) agentLayer.draw(d, world, interp(), selectedGroup);
+      },
+      hitExtra: (sx, sy) => {
+        if (mode !== 'storm' || !showAgents) return null;
+        const id = agentLayer.hitTest(map.camera, sx, sy, interp());
+        return id >= 0 ? { kind: 'group', id } : null;
       },
     });
     const mapWrap = h('div', { class: 'map' }, map.el, status);
@@ -92,6 +119,24 @@ const page: Page = {
         { value: 'level', label: 'Water level', hint: 'Instant: drag to raise or lower the water' },
       ],
       onChange: (m) => setMode(m),
+    });
+
+    const strategyCtl = createSegmented<Strategy>({
+      label: 'Evacuation strategy',
+      value: strategy,
+      options: [
+        { value: 'naive', label: 'Naive static', hint: 'Plan once on the dry map; never re-plan; wait at closed roads' },
+        { value: 'dynamic', label: 'Dynamic A*', hint: 'A* on live road states, re-plans when roads close' },
+        { value: 'risk', label: 'Risk-aware A*', hint: 'Dynamic A* that also avoids roads at risk of flooding' },
+      ],
+      onChange: (st) => {
+        strategy = st;
+        lastReplans = 0;
+        announcedDone = false;
+        client?.send({ type: 'strategy', strategy: st });
+        log(`Strategy changed to ${strategyWord(st)}; the run was recomputed from the start.`);
+        syncURL();
+      },
     });
 
     const stormCtl = createSegmented<ScenarioId>({
@@ -219,6 +264,7 @@ const page: Page = {
     const stormGroup = h(
       'div',
       null,
+      strategyCtl.el,
       stormCtl.el,
       stormBlurb,
       stormTotals,
@@ -259,6 +305,17 @@ const page: Page = {
       liveFacts,
     );
 
+    const evSheltered = h('div', { class: 'figure' }, '0');
+    const evStranded = h('div', { class: 'figure' }, '0');
+    const evFacts = h('dl', { class: 'facts' });
+    const evacSec = h(
+      'section',
+      { class: 'rail-section' },
+      h('h2', null, 'Evacuation'),
+      h('div', { class: 'big-figures' }, h('div', null, evSheltered, h('div', { class: 'figure-label' }, 'people in relief centres')), h('div', null, evStranded, h('div', { class: 'figure-label' }, 'stuck or stranded'))),
+      evFacts,
+    );
+
     const eventsList = h('ol', { class: 'notes', reversed: true });
     const eventsSec = h('section', { class: 'rail-section' }, h('h2', null, 'Events'), eventsList);
 
@@ -293,7 +350,11 @@ const page: Page = {
         reloadWorld();
       },
     });
-    const layers = h('section', { class: 'rail-section' }, h('h2', null, 'Layers'), ...layerDefs.map(([k, label]) => createToggle({ label, value: true, onChange: (v) => map.setLayers({ [k]: v }) }).el), h('div', { style: 'margin-top: var(--s-3)' }, qualityCtl.el));
+    const agentToggles = [
+      createToggle({ label: 'Evacuee groups', value: true, onChange: (v) => { showAgents = v; map.requestRender(); } }).el,
+      createToggle({ label: 'Planned routes', value: true, onChange: (v) => { agentLayer.showRoutes = v; map.requestRender(); } }).el,
+    ];
+    const layers = h('section', { class: 'rail-section' }, h('h2', null, 'Layers'), ...agentToggles, ...layerDefs.map(([k, label]) => createToggle({ label, value: true, onChange: (v) => map.setLayers({ [k]: v }) }).el), h('div', { style: 'margin-top: var(--s-3)' }, qualityCtl.el));
 
     const legend = h(
       'section',
@@ -312,7 +373,12 @@ const page: Page = {
           ['flyover', 'Flyover (stays dry)'],
           ['tunnel', 'Subway or underpass (floods first)'],
           ['mangrove', 'Mangroves and wetland'],
-          ['shelter', 'Relief centre'],
+          ['shelter', 'Relief centre (arc: how full)'],
+          ['gMoving', 'Evacuee group on the move'],
+          ['gWaiting', 'Group waiting to leave'],
+          ['gStuck', 'Group stuck at a closed road'],
+          ['gStranded', 'Group with no reachable centre'],
+          ['route', 'Planned route'],
         ] as [string, string][]).map(([k, label]) => h('li', null, h('span', { html: LEGEND_SVG[k], 'aria-hidden': 'true' }), label)),
       ),
     );
@@ -320,13 +386,13 @@ const page: Page = {
     const notesList = h('ul', { class: 'notes' });
     const notes = h('section', { class: 'rail-section' }, h('h2', null, 'About this map'), notesList);
 
-    const rail = h('aside', { class: 'rail', 'aria-label': 'Flood controls and map information' }, control, live, eventsSec, inspector, city, layers, legend, notes);
+    const rail = h('aside', { class: 'rail', 'aria-label': 'Flood controls and map information' }, control, live, evacSec, eventsSec, inspector, city, layers, legend, notes);
     root.append(h('div', { class: 'map-layout' }, mapWrap, rail));
     const sheet = makeSheet(rail, 'Controls');
 
     // ── Helpers ──
     function syncURL() {
-      replaceParams({ ...scenarioToURL(sp), ...(mode === 'level' ? { mode: 'level', level: level.toFixed(1) } : {}), ...(travel === 'foot' ? { travel } : {}) });
+      replaceParams({ ...scenarioToURL(sp), ...(strategy !== 'dynamic' ? { strategy } : {}), ...(mode === 'level' ? { mode: 'level', level: level.toFixed(1) } : {}), ...(travel === 'foot' ? { travel } : {}) });
     }
 
     function log(sentence: string) {
@@ -438,6 +504,33 @@ const page: Page = {
       lastState = state.slice();
     }
 
+    function updateEvacuation(m: AgentMetrics, at: number, jump: boolean, p: Float32Array | null) {
+      const total = m.sheltered + m.enRoute + m.waiting + m.stranded + m.noAccess;
+      let stuck = 0;
+      if (p) for (let o = 0; o < p.length; o += 6) if (p[o + 2] === Status.Stuck) stuck += p[o + 3];
+      evSheltered.textContent = fmtInt(m.sheltered);
+      evStranded.textContent = fmtInt(stuck + m.stranded + m.noAccess);
+      evFacts.replaceChildren(
+        ...([
+          ['Strategy', strategyWord(strategy)],
+          ['Sheltered', `${fmtInt(m.sheltered)} of ${fmtInt(total)} (${total ? Math.round((m.sheltered / total) * 100) : 0}%)`],
+          ['On the move', fmtInt(m.enRoute - stuck)],
+          ['Waiting at a closed road', fmtInt(stuck)],
+          ['Not left yet', fmtInt(m.waiting)],
+          ['No reachable centre', fmtInt(m.stranded + m.noAccess)],
+          ['Mean trip (sheltered)', m.sheltered ? fmtMinutes(m.meanMinutes) : 'n/a'],
+          ['95th percentile trip', m.sheltered ? fmtMinutes(m.p95Minutes) : 'n/a'],
+          ['Re-plans so far', fmtInt(m.replans)],
+        ] as [string, string][]).flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)]),
+      );
+      if (!jump && m.replans - lastReplans >= 3) log(`${m.replans - lastReplans} groups re-planned around closed roads at ${fmtClock(at)}.`);
+      lastReplans = m.replans;
+      if (!jump && !announcedDone && m.waiting === 0 && m.enRoute === 0 && m.sheltered > 0) {
+        announcedDone = true;
+        log(`Evacuation finished at ${fmtClock(at)}: ${fmtInt(m.sheltered)} people sheltered, ${fmtInt(m.stranded + m.noAccess)} could not reach a centre.`);
+      }
+    }
+
     function onFrame(f: FrameMsg) {
       if (signal.aborted || mode !== 'storm') {
         requestAnimationFrame(() => client?.send({ type: 'ack' }));
@@ -447,7 +540,11 @@ const page: Page = {
       lastFrame = f;
       const jump = Math.abs(f.minute - lastMinute) !== 1;
       minute = f.minute;
-      map.setDepth(f.depth, f.flow, { reset: jump, intervalMs: f.playing ? 1000 / Number(speed) : 0 });
+      frameAt = performance.now();
+      frameInterval = f.playing ? 1000 / Number(speed) : 0;
+      map.setDepth(f.depth, f.flow, { reset: jump, intervalMs: frameInterval });
+      agentLayer.setPositions(f.agents, !jump, world?.shelters.length ?? 0);
+      if (f.metrics) updateEvacuation(f.metrics, f.minute, jump, f.agents);
       map.setEdgeState(f.edgeState);
       map.setRain(clamp(f.stats.rain / 120, 0, 1));
       scrubber.set(f.minute);
@@ -508,6 +605,10 @@ const page: Page = {
       scrubber.setDuration(duration);
       scrubber.setHydrograph(rainSeries(resolveStorm(sp), 240));
       c.on('frame', onFrame);
+      c.on('routes', (r) => {
+        agentLayer.setRoutes(r.ids, r.offsets, r.nodes);
+        map.requestRender();
+      });
       c.on('series', (s) => {
         for (let i = 0; i < s.stage.length; i++) stage[s.from + i] = s.stage[i];
         drawHydrograph();
@@ -531,7 +632,11 @@ const page: Page = {
       const setup = buildFloodSetup(w);
       const notLand = new Uint8Array(w.terrain.n * w.terrain.n);
       for (let k = 0; k < notLand.length; k++) notLand[k] = w.sea[k] || w.terrain.channel[k] ? 1 : 0;
-      c.send({ type: 'init', setup, forcing: buildForcing(sp), edges: table!, ground: w.ground, gaugeCell: pickGaugeCell(w), mode: travel, notLand });
+      agentLayer.clear();
+      selectedGroup = -1;
+      lastReplans = 0;
+      announcedDone = false;
+      c.send({ type: 'init', setup, forcing: buildForcing(sp), edges: table!, ground: w.ground, gaugeCell: pickGaugeCell(w), mode: travel, notLand, agents: buildAgentSetup(w, strategy, travel) });
       if (sp.rainScale !== 1) c.send({ type: 'rain', scale: sp.rainScale });
       renderStormInfo();
     }
@@ -607,10 +712,17 @@ const page: Page = {
           ['Pick-up junction', hd.accessNode >= 0 ? `J${hd.accessNode}` : 'no road access'],
           ['Facilities', [hd.hasHospital ? 'hospital' : '', hd.hasSchool ? 'school' : ''].filter(Boolean).join(', ') || 'none mapped'],
         );
+      } else if (sel.kind === 'group') {
+        const gr = agentLayer.group(sel.id);
+        title = `Evacuee group ${sel.id + 1}`;
+        if (gr) {
+          const statusWord = ['waiting to leave', 'on the move', 'in a relief centre', 'no reachable centre', 'waiting at a closed road', 'turning back from a flooded road', 'no road access'][gr.status] ?? 'unknown';
+          rows.push(['People', fmtInt(gr.size)], ['Status', statusWord], ['Heading for', gr.shelter >= 0 ? w.shelters[gr.shelter].name : 'nowhere yet'], ['Re-plans', String(gr.replans)]);
+        }
       } else if (sel.kind === 'shelter') {
         const s = w.shelters[sel.id];
         title = s.name;
-        rows.push(['Capacity', `${fmtInt(s.capacity)} people`], ['Elevation', `${fmtNum(s.elev, 1)} m`], ['Junction', `J${s.node}`], ['Ground', s.lowGround ? 'fairly low: may be cut off' : 'high']);
+        rows.push(['Capacity', `${fmtInt(s.capacity)} people`], ['Inside now', fmtInt(agentLayer.occupancyOf(s.id))], ['Elevation', `${fmtNum(s.elev, 1)} m`], ['Junction', `J${s.node}`], ['Ground', s.lowGround ? 'fairly low: may be cut off' : 'high']);
       } else {
         const e = w.graph.edges[sel.id];
         const kindWord = { road: e.cls === 'arterial' ? 'main road' : 'road', bridge: 'bridge over water', flyover: 'flyover', tunnel: 'subway / underpass' }[e.kind];
@@ -667,6 +779,10 @@ const page: Page = {
     };
   },
 };
+
+function strategyWord(s: Strategy): string {
+  return { naive: 'naive static routing', dynamic: 'dynamic A* re-planning', risk: 'risk-aware A*' }[s];
+}
 
 function listOf(items: string[]): string {
   if (items.length <= 1) return items[0] ?? '';

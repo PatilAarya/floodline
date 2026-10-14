@@ -432,7 +432,9 @@ function buildGraph(raw: MumbaiRaw, tb: TerrainBuild, notes: string[]): Graph {
       id,
       a: e.a,
       b: e.b,
-      length: Math.max(1, e.len),
+      // Never shorter than the straight line between the ends: the A*
+      // heuristic relies on this (the stored length is rounded to 0.1 m).
+      length: Math.max(1, e.len, Math.hypot(nodes[e.b].x - nodes[e.a].x, nodes[e.b].y - nodes[e.a].y)),
       speed: (SPEED[e.hw] ?? 6.9) * (e.link ? 0.8 : 1),
       capacity: CAPACITY[e.hw] ?? 600,
       cls,

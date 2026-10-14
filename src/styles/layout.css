@@ -305,3 +305,30 @@ body[data-route="simulator"] { overflow: hidden; }
 }
 .map-canvas.map-input { touch-action: none; }
 @media (max-width: 1024px) { .map-credit { bottom: calc(4.5rem + env(safe-area-inset-bottom)); } }
+
+/* ───────────────────────── Charts ───────────────────────── */
+.chart { margin: 0 0 var(--s-6); }
+.chart-title { font-family: var(--font-mono); font-size: var(--step--1); letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin-bottom: var(--s-2); }
+.chart svg text { font-size: 12px; fill: var(--text); }
+.chart .bar-label { font-family: var(--font-body); }
+.chart .bar-value { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* ───────────────────────── Algorithms race ───────────────────────── */
+.algo-map { position: relative; height: min(62vh, 640px); min-height: 340px; border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); margin: 0 calc(-1 * var(--gutter)); }
+.algo-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: var(--s-4) var(--s-7); padding: var(--s-5) 0; border-bottom: 1px solid var(--hairline); }
+.race { display: grid; grid-template-columns: repeat(auto-fit, minmax(15.5rem, 1fr)); margin: 0 calc(-1 * var(--gutter)); border-bottom: 1px solid var(--hairline); }
+.race-panel { padding: var(--s-4) var(--gutter) var(--s-5); border-left: 1px solid var(--hairline); min-width: 0; }
+.race-panel:first-child { border-left: 0; }
+.race-panel h3 { font-size: var(--step-1); margin: 0 0 var(--s-1); }
+.race-panel .how { font-size: var(--step--1); color: var(--muted); margin: 0 0 var(--s-3); min-height: 2.6em; }
+.race-canvas { position: relative; width: 100%; aspect-ratio: 1 / 1; }
+.race-canvas canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.race-panel .facts { margin-top: var(--s-3); }
+.race-panel .verdict { font-family: var(--font-mono); font-size: 0.8rem; margin-top: var(--s-2); min-height: 1.3em; }
+@media (max-width: 700px) {
+  .race-panel { border-left: 0; border-top: 1px solid var(--hairline); }
+  .race-panel:first-child { border-top: 0; }
+}
+.marker-legend { display: flex; flex-wrap: wrap; gap: var(--s-2) var(--s-5); font-size: var(--step--1); color: var(--muted); margin: var(--s-3) 0 0; padding: 0; list-style: none; }
+.marker-legend li { display: flex; align-items: center; gap: var(--s-2); }
+.marker-legend svg { width: 22px; height: 14px; }
