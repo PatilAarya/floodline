@@ -4,7 +4,7 @@ College AI mini project (viva-defended): a front-end-only dynamic flood evacuati
 Full original brief: `flood-evacuation-claude-code-prompt.md` (the source of truth if anything here is ambiguous).
 
 ## Current status (read first)
-Phases 1-5 are done (plus the Mumbai/light-theme scope change). **Next: phase 6 (CSP + SA/HC, Assignment page).**
+Phases 1-6 are done (plus the Mumbai/light-theme scope change). **Next: phase 7 (Simulator integration: strategy 3 = risk-aware + CSP + SA).**
 `HANDOFF.md` has the full state, the architecture as built, gotchas, and the detailed plan for phases 6-10. Read it before starting.
 
 ## Hard rules

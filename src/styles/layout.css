@@ -408,3 +408,48 @@ body[data-route="simulator"] { overflow: hidden; }
 .cpt-table .must { font-family: var(--font-body); font-weight: 600; color: var(--accent-ink); }
 .cpt-errors p { margin: var(--s-2) 0 0; }
 .cpt-error-line { font-weight: 600; border-left: 3px solid var(--text); padding-left: var(--s-3); }
+
+/* ── Assignment (CSP + local search) ── */
+.asg-mapnote { padding: var(--s-3) 0; border-bottom: 1px solid var(--hairline); min-height: 3.2rem; }
+.asg-mapnote p { margin: 0 0 var(--s-2); }
+.asg-verdict { font-size: var(--step-1); line-height: 1.45; padding: var(--s-2) 0 var(--s-2) var(--s-3); border-left: 2px solid var(--primary); margin: var(--s-5) 0 var(--s-3); }
+.asg-verdict[data-state="fail"] {
+  border-left: 3px solid var(--text); font-weight: 600;
+  background: repeating-linear-gradient(45deg, color-mix(in oklab, var(--accent) 18%, transparent) 0 2px, transparent 2px 8px);
+}
+.asg-verdict.small-verdict { font-size: var(--step-0); margin-top: var(--s-4); }
+.asg-why p { font-size: var(--step--1); }
+.asg-relaxed { border-left: 1px dashed var(--text); padding-left: var(--s-3); }
+.asg-figures { margin: var(--s-5) 0 var(--s-3); grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); }
+.asg-figures .figure { font-size: clamp(1.4rem, 1rem + 1.2vw, 2.2rem); }
+.asg-diff { margin-top: var(--s-4); }
+.diff-list li { font-size: var(--step--1); color: var(--text); }
+
+.tree-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(14rem, 19rem); gap: var(--s-5) var(--s-7); align-items: start; }
+@media (max-width: 900px) { .tree-layout { grid-template-columns: minmax(0, 1fr); } }
+.tree-wrap { overflow: auto; max-height: 34rem; overscroll-behavior: contain; border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); padding: var(--s-2) 0; }
+.tree { display: block; }
+.tree .t-level { stroke: var(--hairline); }
+.tree .t-edge { stroke: color-mix(in oklab, var(--text) 30%, transparent); stroke-width: 1; }
+.tree .t-edge.dead { stroke-dasharray: 3 3; }
+.tree .t-edge.path { stroke: color-mix(in oklab, var(--primary) 70%, var(--text)); stroke-width: 3; }
+.tree .t-node { fill: var(--background); stroke: var(--text); stroke-width: 1.3; }
+.tree .t-node.failed { stroke: var(--faint); }
+.tree .t-node.path { fill: var(--text); }
+.tree .t-node.root { fill: var(--text); }
+.tree .t-goal { fill: none; stroke: color-mix(in oklab, var(--primary) 70%, var(--text)); stroke-width: 2; }
+.tree .t-x { stroke: var(--muted); stroke-width: 1.4; }
+.tree .t-wipe { stroke: var(--accent-ink); stroke-width: 1.5; }
+.tree .t-label { font-family: var(--font-mono); font-size: 10px; fill: var(--muted); }
+.tree-facts { margin-top: var(--s-2); }
+.tree-path { margin-top: var(--s-4); color: var(--muted); }
+
+.energy-chart svg { display: block; width: 100%; max-width: 900px; height: auto; margin: var(--s-4) 0 var(--s-2); }
+.energy-chart .grid { stroke: var(--hairline); }
+.energy-chart .tick { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); }
+.energy-chart .start { stroke: var(--text); stroke-opacity: 0.5; stroke-dasharray: 2 4; }
+.energy-chart .sa-cur, .marker-legend .sa-cur { fill: none; stroke: color-mix(in oklab, var(--accent) 60%, transparent); stroke-width: 1; }
+.energy-chart .sa-best, .marker-legend .sa-best { fill: none; stroke: color-mix(in oklab, var(--primary) 70%, var(--text)); stroke-width: 2.6; }
+.energy-chart .hc, .marker-legend .hc { fill: none; stroke: var(--text); stroke-width: 1.8; stroke-dasharray: 7 4; }
+.energy-chart .temp, .marker-legend .temp { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 1 3; stroke-linecap: round; }
+.energy-chart .uphill, .marker-legend .uphill { stroke: var(--accent-ink); stroke-width: 1; stroke-opacity: 0.6; }

@@ -29,8 +29,8 @@ The original brief is `flood-evacuation-claude-code-prompt.md`.
 | 3 Flood sim + WebGL | done |
 | 4 Search + agents + re-planner + Algorithms race | done |
 | 5 Bayesian network | done |
-| **6 CSP + SA/HC (Assignment page)** | **next** |
-| 7 Simulator integration | todo (much already exists, see section 4) |
+| 6 CSP + SA/HC (Assignment page) | done |
+| **7 Simulator integration** | **next** (much already exists, see section 5) |
 | 8 Experiments | todo |
 | 9 Home narrative, Viva page, polish, docs | todo |
 | 10 Deploy-ready handoff | todo |
@@ -46,7 +46,7 @@ dynamic A* 406,000 sheltered, mean 38, p95 108; risk-aware A* (BN posterior) 406
 ```
 npm i
 npm run dev          # http://localhost:5173 (also .claude/launch.json "floodline-dev")
-npx vitest run       # 20 tests, ~4 s
+npx vitest run       # 24 tests, ~6 s
 npm run build        # tsc --noEmit && vite build -> dist/
 npm run fetch:mumbai # re-download raw OSM + SRTM (only if needed; slow, rate-limited)
 npm run build:mumbai # rebuild src/data/mumbai.json from scripts/.cache
@@ -97,8 +97,19 @@ Versions installed: Vite 8, TypeScript 7, Vitest 5, Node 22. Windows machine (Po
 - `pages/algorithms.ts`: race page (presets on real places, flood level, travel mode, lambda, bad-heuristic toggle, replay speed, 5-6 panels, table, bar charts).
 - `pages/home.ts` (simple hero + 4 chapters; phase 9 adds the scroll narrative), `pages/kit.ts` (unlisted `#/kit`), placeholders: `bayes.ts`, `assignment.ts`, `experiments.ts`, `viva.ts` (use `pageHead()` / `comingInPhase()` from `_shared.ts`).
 
+### CSP and local search (`src/ai/csp/`, `src/ai/local/`, `src/sim/assignment.ts`)
+- `csp/model.ts`: generic CSP (shared value set, domains in preferred order, neighbour lists, optional binary `compatible`, optional global capacity via `size`/`capacity`, `cost` for tie-breaks), `mapColouring()`, `capacityNeighbours()` (domains overlap = neighbours), `consistent()`, `isSolution()`, `SearchState` (alive bitmap + removal trail).
+- `csp/forwardChecking.ts` (`forwardCheck` prunes binary clashes and values a neighbour no longer fits in, returns the wiped-out var; `undoTo(mark)`), `csp/heuristics.ts` (MRV via legal counts, dynamic degree tie-break, LCV with travel-time tie-break, `prefer` warm start), `csp/backtracking.ts` (`solveCSP(csp, {forwardChecking, mrv, degree, lcv, maxNodes, maxMs, prefer}, onEvent)`; events assign/reject/prune/wipeout/unassign/backtrack/solution/fail/budget; returns best partial on budget).
+- `csp/relax.ts`: `explainInfeasibility` (empty domains + Hall's condition over all 2^m centre subsets; min over subsets also gives the max-flow/min-cut bound on people placeable), `maximisePartial` (greedy fewest-options-first + one-step ejection repair), `smallestRelaxation` (deadline steps).
+- `local/objective.ts`: energy in person-minutes = travel + lambda(2) x exposure + 600/person over capacity + 500 x sum cap (fill - mean)^2 + 15,000 per extra centre per hood + 1,000/person unsheltered (only if the group has an allowed centre). `AssignmentState.apply/delta` in O(S). Moves: reassign or swap (`randomMove`).
+- `local/cooling.ts` (geometric/linear, `autoT0` = median uphill delta, p0 0.6), `local/simulatedAnnealing.ts` (`Annealer` stepper, restarts, trace + uphill markers), `local/hillClimbing.ts` (`HillClimber` steepest = full scan incl. swaps, first-choice with patience 4000).
+- `sim/assignment.ts`: `prepareNetwork(world, level, mode)` = road states from `waterLevelFlood`, one Dijkstra per centre (times in minutes, monsoon traffic speeds) with exposure (BN + depth `edgeRisk`) and `nextHop` along the same tree, centre flooded/risk. `buildInstance(prep, {deadline, maxRisk, capacityScale, closed, hoods?, centres?, capacities?})` -> CSP + `AssignmentModel` + per-pair `reason` (closed/flooded/cut off/risky/too far); `explainGroup()`.
+- Default numbers (dry, deadline 40, all centres): 178 groups, 411,000 people. FC+MRV(+degree+LCV) solves in 178 nodes; plain backtracking and BT+MRV run out of the 50k budget. Deadline 25-30: infeasible by counting. Level 1 m: 2 groups cut off, relaxed plan 406,900 = bound. SA (300k, geometric) ~9.48M vs steepest HC ~9.73M vs CSP 13.8M person-min; linear cooling is consistently worse (stays hot too long), said honestly on the page.
+- Page `pages/assignment.ts`: map with flow arcs hood -> centre (width ~ sqrt(people)), centre fill rings and load/capacity, hatched rings for people without a centre, tap a hood (where its people go) or a centre (close/reopen). Controls: water level, deadline, centre risk limit, capacity scale, close centres, FC/MRV/degree/LCV toggles. Auto re-solve on every change with warm start (`prefer`) and a diff list. If counting proves infeasibility the search is skipped. Compare-six-settings table + bar chart. Search tree lab: Mahim + Matunga West + Indira Nagar (12 groups), 4 nearest centres, deadline 18, capacity x1.15 (plain 152 nodes / 95 backtracks, FC 97 / 15 wipeouts, FC+MRV 12). Energy plot (x = moves evaluated, log temperature axis, uphill rug), comparison table and plan selector for the map.
+- Why that lab instance: with uniform 2,500-person groups, bigger instances are either trivial or symmetric-infeasible (exponential thrash even with FC). Restricted domains via the deadline produce the textbook "MRV/FC finds trouble near the root" effect.
+
 ### Tests (`tests/`)
-`world.test.ts` (synthetic connectivity/determinism), `flood.test.ts` (mass conservation x2, rewind determinism), `bayes.test.ts` (CPTs valid, enumeration == VE to 1e-9 on 7 evidence sets, impossible evidence, LW within 0.02 at 50k, d-separation cases + Bayes-ball == trail enumeration), `search.test.ts` (A* == UCS dry and flooded on Mumbai, admissible + consistent heuristic, BFS/DFS/Greedy never cheaper, clean failure). Tests read `src/data/mumbai.json` with `fs`.
+`world.test.ts` (synthetic connectivity/determinism), `flood.test.ts` (mass conservation x2, rewind determinism), `bayes.test.ts` (CPTs valid, enumeration == VE to 1e-9 on 7 evidence sets, impossible evidence, LW within 0.02 at 50k, d-separation cases + Bayes-ball == trail enumeration), `search.test.ts` (A* == UCS dry and flooded on Mumbai, admissible + consistent heuristic, BFS/DFS/Greedy never cheaper, clean failure), `csp.test.ts` (Australia 3-colouring under all 16 heuristic combos, K4 infeasible under all 16, capacity + Hall explanation + partial bound, node budget). Tests read `src/data/mumbai.json` with `fs`.
 
 ---
 
@@ -111,6 +122,8 @@ Versions installed: Vite 8, TypeScript 7, Vitest 5, Node 22. Windows machine (Po
 - Performance: the flood model runs ~20 M cell-updates/s; 12 h storm at 128 grid ~17-25 s with agents. Don't add per-cell work to the hot loop in `floodModel.substep`. Agents re-plan only when an edge on their route changes or every 20 min.
 - Determinism matters (rewind must replay identically): anything that steps per minute in the engine must be included in keyframes (`Keyframe { flood, agents }`). If you add BN state that evolves over time (e.g. sensor readings), make it a pure function of (seed, minute, flood state) or snapshot it.
 - `npm run build` runs `tsc --noEmit` first.
+- To exercise rAF-driven animations (tree replay, local search) with the pane hidden, shim it from `javascript_tool`: `window.requestAnimationFrame = cb => setTimeout(() => cb(performance.now()), 16)`.
+- Probe scripts: put a temporary `tests/zz_*.test.ts` (vitest only includes `tests/**`) and run with `--silent=false`; delete it afterwards.
 
 ---
 
