@@ -31,8 +31,8 @@ The original brief is `flood-evacuation-claude-code-prompt.md`.
 | 5 Bayesian network | done |
 | 6 CSP + SA/HC (Assignment page) | done |
 | 7 Simulator integration | done |
-| **8 Experiments** | **next** |
-| 9 Home narrative, Viva page, polish, docs | todo |
+| 8 Experiments | done |
+| **9 Home narrative, Viva page, polish, docs** | **next** |
 | 10 Deploy-ready handoff | todo |
 
 Current numbers (26 July 2005 storm, default seed `mumbai`, 128 grid, vehicles):
@@ -116,6 +116,13 @@ Versions installed: Vite 8, TypeScript 7, Vitest 5, Node 22. Windows machine (Po
 - `positions()` stride is now `STRIDE` = 8 (exported from agents.ts): + eta, arrivedAt. `AgentLayer` has `bookedFor`, `raw()`.
 - Frames carry `assign: AssignEvent[]`; the page logs each once (dedupe key minute:kind; checks that moved nobody are not logged). Inspector: group (neighbourhood + number, leaves at, assigned centre, ETA free-flow, arrived), centre (booked), neighbourhood (groups, in a centre now, assigned centres). Water-level mode: "Cut off from every centre" (debounced `prepareNetwork`).
 - Numbers, 26 July 2005, seed mumbai, vehicles: grid 128: dynamic 406,000 sheltered, mean 38, p95 108; CSP+SA 406,000, mean 36, p95 80 (18 s). Grid 192: dynamic 422,500, 34 / 68; CSP+SA 422,500, 31 / 57. Naive 128: 298,600, 122 / 497 (unchanged). The older "risk-aware A* only" (phase 5) had p95 73 at 128; that strategy no longer exists separately.
+
+### Experiments (phase 8: `src/sim/experiment.ts`, `experimentWorker.ts`, `experimentClient.ts`, `pages/experiments.ts`)
+- `runSeed(prep, {scenario, seed, mode})`: ONE flood run per seed, all three strategies' `AgentSim`s stepped through the same road states and BN risk (paired comparison, ~3x cheaper). The per-minute order copies `FloodEngine.updateRoads` exactly, so seed `mumbai` reproduces the Simulator's numbers (checked: naive 298,600 / 122 / 497; dynamic 406,000 / 38 / 108; CSP+SA 406,000 / 36 / 80 at grid 128). Also records rain, peak, max flooded km², max closed roads, and t90 (minute 90% of demand sheltered). If you change `updateRoads` in the engine, change it here too.
+- Grid 128 (grid 96 is not faster and changes results). One seed = 12-27 s for all three strategies.
+- `ExperimentPool`: `defaultWorkerCount()` = cores - 1, max 6; each worker builds the world once, then takes seeds one at a time; progress every 30 sim-minutes; `cancel()` terminates all. No-worker fallback runs seeds inline with pauses.
+- Page: seeds slider (5-100, default 50; seed 1 = `mumbai`, others `run-N`), storm preset or "all four in turn", travel mode, Run / Cancel / Download CSV (long format: one row per seed x strategy). Live progress bar with ETA. Results stream in: three big figures (mean % sheltered), conclusion with exact sign tests (`src/core/stats.ts`), paired per-seed chart, two difference strips, five box/strip plots, summary table (mean, sd, median, worst). Charts in `src/ui/charts/strip.ts` encode strategies by marker shape (open circle naive, open square dynamic, filled diamond CSP+SA). The last run is kept in a module variable (lost on reload or HMR).
+- Default run (50 storms, 26 July 2005 shape, vehicles, 5 workers on a 12-core machine): 6 min 33 s. Mean share sheltered: naive 69.7%, dynamic 97.9%, CSP+SA 97.9%. CSP+SA sheltered more than naive in 50/50 storms (+115,978 people on average, sign test p < 0.001). Against dynamic: more in 1, fewer in 3, same in 46; p95 shorter in 40, longer in 8 (mean p95 147 vs 169 min, median 76 vs 77, p < 0.001). Mean trip 38.4 vs 40.1 (naive 113.6). Minutes to 90% sheltered: 273 vs 304 (naive never). Use these honestly in the viva: the CSP+SA gain over dynamic A* is speed and the worst-case tail, not the number sheltered.
 
 ### Tests (`tests/`)
 `world.test.ts` (synthetic connectivity/determinism), `flood.test.ts` (mass conservation x2, rewind determinism), `bayes.test.ts` (CPTs valid, enumeration == VE to 1e-9 on 7 evidence sets, impossible evidence, LW within 0.02 at 50k, d-separation cases + Bayes-ball == trail enumeration), `search.test.ts` (A* == UCS dry and flooded on Mumbai, admissible + consistent heuristic, BFS/DFS/Greedy never cheaper, clean failure), `csp.test.ts` (Australia 3-colouring under all 16 heuristic combos, K4 infeasible under all 16, capacity + Hall explanation + partial bound, node budget). Tests read `src/data/mumbai.json` with `fs`.

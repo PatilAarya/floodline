@@ -453,3 +453,31 @@ body[data-route="simulator"] { overflow: hidden; }
 .energy-chart .hc, .marker-legend .hc { fill: none; stroke: var(--text); stroke-width: 1.8; stroke-dasharray: 7 4; }
 .energy-chart .temp, .marker-legend .temp { fill: none; stroke: var(--muted); stroke-width: 1.2; stroke-dasharray: 1 3; stroke-linecap: round; }
 .energy-chart .uphill, .marker-legend .uphill { stroke: var(--accent-ink); stroke-width: 1; stroke-opacity: 0.6; }
+
+/* ── Experiments ── */
+.exp-legend { margin: 0 0 var(--s-4); }
+.exp-legend li { align-items: baseline; }
+.exp-legend svg, .figure-label svg { width: 16px; height: 16px; vertical-align: -3px; }
+.exp-progress-wrap { padding: var(--s-4) 0 var(--s-2); }
+.exp-progress { position: relative; height: 10px; }
+.exp-progress-track { position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: var(--hairline-strong); }
+.exp-progress-fill { position: absolute; left: 0; top: 3px; height: 4px; width: 0; background: color-mix(in oklab, var(--primary) 75%, var(--text)); transition: width var(--dur-2) var(--ease); }
+@media (prefers-reduced-motion: reduce) { .exp-progress-fill { transition: none; } }
+.exp-figures .figure { font-size: clamp(1.8rem, 1.2rem + 2vw, 3.2rem); }
+.exp-conclusion { max-width: 68ch; margin-top: var(--s-5); }
+.exp-figure svg { display: block; width: 100%; max-width: 900px; height: auto; margin: var(--s-2) 0; }
+.exp-scroll { overflow-x: auto; overscroll-behavior-x: contain; }
+.exp-scroll svg { max-width: none; min-width: 600px; }
+.exp-chart .grid { stroke: var(--hairline); }
+.exp-chart .tick { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); }
+.exp-chart .row-label { font-family: var(--font-body); font-size: 13px; fill: var(--text); }
+.exp-chart .whisker { stroke: var(--text); stroke-opacity: 0.5; stroke-width: 1; }
+.exp-chart .box { fill: var(--wash); stroke: var(--text); stroke-opacity: 0.55; stroke-width: 1; }
+.exp-chart .median { stroke: var(--text); stroke-width: 3; }
+.exp-chart .pair { stroke: var(--text); stroke-opacity: 0.25; stroke-width: 1; }
+.exp-chart .zero { stroke: var(--text); stroke-width: 1.5; }
+.exp-chart .good-side { fill: var(--wash); }
+.exp-chart .mk { stroke-width: 1.3; }
+.exp-chart .mk-circle { fill: var(--background); stroke: var(--muted); }
+.exp-chart .mk-square { fill: var(--background); stroke: var(--text); }
+.exp-chart .mk-diamond { fill: color-mix(in oklab, var(--primary) 65%, var(--text)); stroke: var(--background); stroke-width: 0.8; }
