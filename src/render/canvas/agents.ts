@@ -11,24 +11,25 @@
  * Positions arrive once per simulated minute and are interpolated between.
  */
 import { clamp } from '../../core/units';
-import { Status } from '../../sim/agents';
+import { Status, STRIDE } from '../../sim/agents';
 import type { World } from '../../world/types';
 import { css, mix } from '../theme';
 import type { DrawCtx } from './types';
-
-const STRIDE = 6;
 
 export class AgentLayer {
   private prev: Float32Array | null = null;
   private cur: Float32Array | null = null;
   private routes = new Map<number, Int32Array>();
   private occupancy: number[] = [];
+  /** People heading for (booked into) each centre but not there yet. */
+  private booked: number[] = [];
   showRoutes = true;
 
   clear(): void {
     this.prev = this.cur = null;
     this.routes.clear();
     this.occupancy = [];
+    this.booked = [];
   }
 
   /** New positions; `continuous` = the next minute after the previous frame (interpolate). */
@@ -36,8 +37,13 @@ export class AgentLayer {
     this.prev = continuous && this.cur && p && this.cur.length === p.length ? this.cur : p;
     this.cur = p;
     this.occupancy = new Array(shelters).fill(0);
+    this.booked = new Array(shelters).fill(0);
     if (!p) return;
-    for (let o = 0; o < p.length; o += STRIDE) if (p[o + 2] === Status.Sheltered && p[o + 4] >= 0) this.occupancy[p[o + 4]] += p[o + 3];
+    for (let o = 0; o < p.length; o += STRIDE) {
+      if (p[o + 4] < 0) continue;
+      if (p[o + 2] === Status.Sheltered) this.occupancy[p[o + 4]] += p[o + 3];
+      else if (p[o + 2] !== Status.NoAccess) this.booked[p[o + 4]] += p[o + 3];
+    }
   }
 
   setRoutes(ids: Int32Array, offsets: Int32Array, nodes: Int32Array): void {
@@ -52,15 +58,24 @@ export class AgentLayer {
     return this.cur ? this.cur.length / STRIDE : 0;
   }
 
-  group(id: number): { x: number; y: number; status: number; size: number; shelter: number; replans: number } | null {
+  group(id: number): { x: number; y: number; status: number; size: number; shelter: number; replans: number; eta: number; arrivedAt: number } | null {
     const p = this.cur;
     if (!p || id < 0 || id * STRIDE >= p.length) return null;
     const o = id * STRIDE;
-    return { x: p[o], y: p[o + 1], status: p[o + 2], size: p[o + 3], shelter: p[o + 4], replans: p[o + 5] };
+    return { x: p[o], y: p[o + 1], status: p[o + 2], size: p[o + 3], shelter: p[o + 4], replans: p[o + 5], eta: p[o + 6], arrivedAt: p[o + 7] };
   }
 
   occupancyOf(shelter: number): number {
     return this.occupancy[shelter] ?? 0;
+  }
+
+  bookedFor(shelter: number): number {
+    return this.booked[shelter] ?? 0;
+  }
+
+  /** Raw positions (STRIDE numbers per group), for per-neighbourhood summaries. */
+  raw(): Float32Array | null {
+    return this.cur;
   }
 
   /** Nearest visible group within 12 px of a screen point. */

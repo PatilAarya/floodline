@@ -20,6 +20,9 @@ import type { TravelMode } from './hydrology';
  */
 export const MONSOON_TRAFFIC = 0.35;
 
+/** Minute the evacuation warning is issued (strategy 3 assigns centres then). */
+export const WARNING_AT = 45;
+
 /** Minutes to load a group of evacuees before it can leave. */
 export const BOARDING_MINUTES = 15;
 
@@ -57,7 +60,7 @@ export interface GroupOptions {
   spread: number;
 }
 
-export function buildGroups(w: World, o: GroupOptions = { warningAt: 45, spread: 150 }): GroupSpec[] {
+export function buildGroups(w: World, o: GroupOptions = { warningAt: WARNING_AT, spread: 150 }): GroupSpec[] {
   const out: GroupSpec[] = [];
   const G = w.groupSize;
   // Lowest neighbourhoods first.
@@ -77,7 +80,7 @@ export function buildGroups(w: World, o: GroupOptions = { warningAt: 45, spread:
   return out;
 }
 
-export function buildAgentSetup(w: World, strategy: Strategy, mode: TravelMode, lambda = 2): AgentSetup {
+export function buildAgentSetup(w: World, strategy: Strategy, mode: TravelMode, lambda = 2, seed = 'mumbai'): AgentSetup {
   return {
     net: buildNet(w, mode),
     shelters: w.shelters.map((s) => ({ node: s.node, capacity: s.capacity })),
@@ -85,5 +88,7 @@ export function buildAgentSetup(w: World, strategy: Strategy, mode: TravelMode, 
     strategy,
     mode,
     lambda,
+    seed,
+    warningAt: WARNING_AT,
   };
 }

@@ -14,6 +14,9 @@
  *               crowded centres are slower to admit people and worse to stay in
  *   split       SPLIT per extra centre a neighbourhood is spread over
  *               (the soft "keep neighbourhoods together" constraint)
+ *   change      CHANGE per person sent to a different centre than `prefer`
+ *               (only when re-planning a running evacuation: people already
+ *               told where to go should not be moved for a tiny gain)
  *   unsheltered UNSHELTERED per person left without a centre although some
  *               centre was allowed (only in relaxed plans). Groups with no
  *               allowed centre at all cannot be helped by any plan, so they
@@ -36,6 +39,8 @@ export interface Weights {
   split: number;
   /** Person-minutes per person left without a centre. */
   unsheltered: number;
+  /** Person-minutes per person moved away from their previous centre (0 = no penalty). */
+  change?: number;
 }
 
 export const DEFAULT_WEIGHTS: Weights = { lambda: 2, overload: 600, imbalance: 500, split: 15000, unsheltered: 1000 };
@@ -56,6 +61,8 @@ export interface AssignmentModel {
   /** Centres each group may use (its CSP domain). */
   options: Int32Array[];
   weights: Weights;
+  /** Previous centre of each group (-1 none); with weights.change, moving costs. */
+  prefer?: Int32Array;
 }
 
 export interface EnergyParts {
@@ -65,6 +72,7 @@ export interface EnergyParts {
   imbalance: number;
   split: number;
   unsheltered: number;
+  change: number;
 }
 
 /** A move: set group g to centre s (a reassignment is one change, a swap two). */
@@ -78,6 +86,7 @@ export class AssignmentState {
   private hoodUse: Float64Array;
   private hoodDistinct: Int32Array;
   private groupSum = 0;
+  private changeSum = 0;
   private riskSum = 0;
   private unshelteredSum = 0;
   private splitSum = 0;
@@ -99,11 +108,11 @@ export class AssignmentState {
 
   /** Total energy (person-minutes). */
   get energy(): number {
-    return this.groupSum + this.m.weights.lambda * this.riskSum + this.unshelteredSum + this.splitSum + this.shelterOverload + this.shelterImbalance;
+    return this.groupSum + this.changeSum + this.m.weights.lambda * this.riskSum + this.unshelteredSum + this.splitSum + this.shelterOverload + this.shelterImbalance;
   }
 
   parts(): EnergyParts {
-    return { travel: this.groupSum, risk: this.m.weights.lambda * this.riskSum, overload: this.shelterOverload, imbalance: this.shelterImbalance, split: this.splitSum, unsheltered: this.unshelteredSum };
+    return { travel: this.groupSum, risk: this.m.weights.lambda * this.riskSum, overload: this.shelterOverload, imbalance: this.shelterImbalance, split: this.splitSum, unsheltered: this.unshelteredSum, change: this.changeSum };
   }
 
   /** Apply a move. Returns the move that undoes it. */
@@ -130,7 +139,7 @@ export class AssignmentState {
     this.load.fill(0);
     this.hoodUse.fill(0);
     this.hoodDistinct.fill(0);
-    this.groupSum = this.riskSum = this.splitSum = 0;
+    this.groupSum = this.riskSum = this.splitSum = this.changeSum = 0;
     this.unshelteredSum = 0;
     for (let g = 0; g < this.m.G; g++) this.unshelteredSum += this.penalty(g);
     for (let g = 0; g < this.m.G; g++) if (a[g] >= 0) this.set(g, a[g]);
@@ -144,6 +153,7 @@ export class AssignmentState {
     if (old === s) return;
     if (old >= 0) {
       this.groupSum -= size * m.time[g * S + old];
+      this.changeSum -= this.changeCost(g, old);
       this.riskSum -= size * m.exposure[g * S + old];
       this.load[old] -= size;
       this.changeHood(h, old, -size);
@@ -152,6 +162,7 @@ export class AssignmentState {
     }
     if (s >= 0) {
       this.groupSum += size * m.time[g * S + s];
+      this.changeSum += this.changeCost(g, s);
       this.riskSum += size * m.exposure[g * S + s];
       this.load[s] += size;
       this.changeHood(h, s, size);
@@ -159,6 +170,12 @@ export class AssignmentState {
       this.unshelteredSum += this.penalty(g);
     }
     this.assign[g] = s;
+  }
+
+  /** Penalty for putting group g in centre s when it was told to go elsewhere. */
+  private changeCost(g: number, s: number): number {
+    const w = this.m.weights.change ?? 0, p = this.m.prefer;
+    return w > 0 && p && p[g] >= 0 && p[g] !== s ? w * this.m.size[g] : 0;
   }
 
   /** Cost of leaving group g without a centre (0 if it has no allowed centre anyway). */

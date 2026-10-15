@@ -11,14 +11,48 @@
  *            closed road it waits for the water to go down.
  *   dynamic  A* on current road states, capacity-aware nearest centre, and
  *            live re-planning with hysteresis (see ai/search/replanner.ts).
- *   risk     As dynamic, but the cost also weighs flood risk on each road
- *            (lambda * P_flood), so routes keep away from roads about to go
- *            under. (Phase 7 adds CSP + simulated annealing assignment.)
+ *   risk     "Risk-aware + CSP + SA". At the evacuation warning every group
+ *            is given a relief centre by the CSP solver (capacity, reachability,
+ *            deadline), improved by simulated annealing (travel time, flood
+ *            exposure, balance), see planner.ts. Routes then use risk-aware A*
+ *            (cost also weighs lambda * P_flood) with the same live
+ *            re-planning as `dynamic`. Every CHECK_EVERY minutes the plan is
+ *            checked: if a group's centre can no longer be reached (or a
+ *            stranded group could now reach one) the assignment is re-run,
+ *            warm-started from the current plan so as few groups as possible move.
  */
 import { makeCostFromArrays } from '../ai/search/cost';
 import { midEdgeDecision, nearestShelter, PERIODIC_EVERY, remainingCost, routeTo, shouldAdoptOptional, type ShelterSlot } from '../ai/search/replanner';
 import type { SearchGraph } from '../ai/search/types';
 import { speedFactor, type TravelMode } from './hydrology';
+import { planAssignment, type PlanGroup } from './planner';
+
+/** Minutes between checks that every group can still reach its centre (strategy risk). */
+export const CHECK_EVERY = 10;
+/** Numbers per group in positions(): x, y, status, size, shelter, replans, eta, arrivedAt. */
+export const STRIDE = 8;
+
+/** A CSP + SA (re-)assignment, reported to the page's events log. */
+export interface AssignEvent {
+  minute: number;
+  kind: 'initial' | 'reassign';
+  status: 'solved' | 'relaxed';
+  why: string;
+  groups: number;
+  people: number;
+  placed: number;
+  cutOff: number;
+  nodes: number;
+  backtracks: number;
+  wipeouts: number;
+  energyCSP: number;
+  energySA: number;
+  /** Groups (and people) whose centre changed. */
+  moved: number;
+  movedPeople: number;
+  /** Centres some group could no longer reach (the trigger). */
+  lostCentres: number[];
+}
 
 export type Strategy = 'naive' | 'dynamic' | 'risk';
 
@@ -57,6 +91,10 @@ export interface AgentSetup {
   strategy: Strategy;
   mode: TravelMode;
   lambda: number;
+  /** Seeds the annealer (with the minute), so plans replay identically. */
+  seed: string;
+  /** Minute of the evacuation warning: when strategy `risk` assigns centres. */
+  warningAt: number;
 }
 
 interface Group {
@@ -79,6 +117,10 @@ interface Group {
   /** Set while finishing or backing off a road that blocked under the group. */
   recovering: boolean;
   routeVersion: number;
+  /** Expected arrival minute (-1 unknown). */
+  eta: number;
+  /** Bit s set: centre s was reachable from the group when it was last planned. */
+  reachMask: number;
 }
 
 export interface AgentMetrics {
@@ -91,12 +133,18 @@ export interface AgentMetrics {
   p95Minutes: number;
   replans: number;
   groups: number;
+  /** CSP + SA runs (strategy risk) and groups moved by re-assignment. */
+  assignRuns: number;
+  reassigned: number;
 }
 
 export interface AgentSnapshot {
   groups: Group[];
   loads: number[];
   prevState: Uint8Array | null;
+  planned: boolean;
+  assignRuns: number;
+  reassigned: number;
 }
 
 export class AgentSim {
@@ -110,6 +158,11 @@ export class AgentSim {
   private cum: Float32Array[] = [];
   /** Groups whose route changed since the last call to takeRouteChanges(). */
   private changed = new Set<number>();
+  /** Strategy risk: has the first assignment been made? */
+  private planned = false;
+  private assignRuns = 0;
+  private reassigned = 0;
+  private events: AssignEvent[] = [];
 
   constructor(setup: AgentSetup) {
     this.s = setup;
@@ -137,21 +190,38 @@ export class AgentSim {
       startedAt: -1,
       recovering: false,
       routeVersion: 0,
+      eta: -1,
+      reachMask: 0,
     }));
     for (const s of this.slots) s.load = 0;
     this.prevState = null;
+    this.planned = false;
+    this.assignRuns = 0;
+    this.reassigned = 0;
+    this.events = [];
     this.changed = new Set(this.groups.map((_, i) => i));
   }
 
   snapshot(): AgentSnapshot {
-    return { groups: structuredClone(this.groups), loads: this.slots.map((s) => s.load), prevState: this.prevState ? this.prevState.slice() : null };
+    return { groups: structuredClone(this.groups), loads: this.slots.map((s) => s.load), prevState: this.prevState ? this.prevState.slice() : null, planned: this.planned, assignRuns: this.assignRuns, reassigned: this.reassigned };
   }
 
   restore(s: AgentSnapshot): void {
     this.groups = structuredClone(s.groups);
     s.loads.forEach((l, i) => (this.slots[i].load = l));
     this.prevState = s.prevState ? s.prevState.slice() : null;
+    this.planned = s.planned;
+    this.assignRuns = s.assignRuns;
+    this.reassigned = s.reassigned;
+    this.events = [];
     this.changed = new Set(this.groups.map((_, i) => i));
+  }
+
+  /** Assignment events since the last call (for the page's events log). */
+  takeEvents(): AssignEvent[] {
+    const e = this.events;
+    this.events = [];
+    return e;
   }
 
   /** One simulated minute. `state`/`depth` are the road states after this minute's water. */
@@ -162,6 +232,17 @@ export class AgentSim {
     const blockedNow = (e: number) => state[e] === 2;
     const becameBlocked = (e: number) => state[e] === 2 && (!prev || prev[e] !== 2);
     const becameWorse = (e: number) => !!prev && state[e] > prev[e];
+
+    // Strategy 3: assign centres at the warning, then check the plan regularly.
+    if (strategy === 'risk') {
+      const time = this.travelSeconds(state, depth);
+      if (!this.planned && minute >= this.s.warningAt) {
+        this.planned = true;
+        this.runAssignment(minute, live, time, risk, 'initial', []);
+      } else if (this.planned && minute % CHECK_EVERY === 0) {
+        this.checkAssignment(minute, live, time, risk);
+      }
+    }
 
     for (let gi = 0; gi < this.groups.length; gi++) {
       const G = this.groups[gi];
@@ -229,7 +310,13 @@ export class AgentSim {
     const naive = this.s.strategy === 'naive';
     const cost = naive ? this.dryCost : live;
     const skip = (s: number) => (G.taboo[s] ?? -1) > minute;
-    const r = nearestShelter(this.g, at, cost, this.slots, G.spec.size, skip, naive);
+    let r: { shelter: number; nodes: number[]; edges: number[]; cost: number } | null = null;
+    // Strategy 3: the group already has a centre from the CSP; go there if possible.
+    if (this.s.strategy === 'risk' && G.shelter >= 0) {
+      const a = routeTo(this.g, at, this.slots[G.shelter].node, cost, this.s.net.vmax);
+      if (a.found) r = { shelter: G.shelter, nodes: a.path, edges: a.edges, cost: a.cost };
+    }
+    if (!r) r = nearestShelter(this.g, at, cost, this.slots, G.spec.size, (s) => skip(s) || (this.s.strategy === 'risk' && s === G.shelter), naive);
     if (first) G.startedAt = minute;
     if (!r) {
       G.status = Status.Stranded;
@@ -242,12 +329,14 @@ export class AgentSim {
     G.pos = 0;
     G.status = Status.Moving;
     G.lastCheck = minute;
+    G.eta = minute + this.routeMinutes(G.edges, 0);
     if (!first) G.replans++;
     this.markChanged(gi);
   }
 
   private assign(gi: number, shelter: number): void {
     const G = this.groups[gi];
+    if (G.shelter === shelter) return;
     // Naive groups do not book places; they just turn up.
     const books = this.s.strategy !== 'naive';
     if (books && G.shelter >= 0) this.slots[G.shelter].load -= G.spec.size;
@@ -289,7 +378,183 @@ export class AgentSim {
     G.edges = G.edges.slice(0, k).concat(next.edges);
     G.replans++;
     G.lastSwitch = minute;
+    G.eta = minute + this.routeMinutes(G.edges, G.i);
     this.markChanged(gi);
+  }
+
+  // ─────────────── Strategy 3: CSP + SA assignment ───────────────
+
+  /** Plain travel time per edge in seconds under the current water (Infinity when closed). */
+  private travelSeconds(state: Uint8Array, depth: Float32Array): (e: number) => number {
+    const net = this.s.net, mode = this.s.mode;
+    return (e: number) => {
+      if (state[e] === 2) return Infinity;
+      const base = mode === 'foot' ? 1.2 : net.speed[e];
+      return net.length[e] / (base * (state[e] === 1 ? Math.max(0.2, speedFactor(depth[e], mode)) : 1));
+    };
+  }
+
+  /** Free-flow minutes for the rest of a route (for the ETA shown in the inspector). */
+  private routeMinutes(edges: number[], from: number): number {
+    const net = this.s.net;
+    let t = 0;
+    for (let k = from; k < edges.length; k++) t += net.length[edges[k]] / (this.s.mode === 'foot' ? 1.2 : net.speed[edges[k]]);
+    return t / 60;
+  }
+
+  /** Groups the planner may (re-)assign, and the junction each would start from. */
+  private candidates(): { gi: number; node: number }[] {
+    const out: { gi: number; node: number }[] = [];
+    this.groups.forEach((G, gi) => {
+      switch (G.status) {
+        case Status.Sheltered:
+        case Status.NoAccess:
+        case Status.Recovering:
+          return;
+        case Status.Waiting:
+          out.push({ gi, node: G.spec.node });
+          return;
+        case Status.Stranded:
+          out.push({ gi, node: G.route[G.route.length - 1] ?? G.spec.node });
+          return;
+        default:
+          out.push({ gi, node: G.route[G.pos > 0 ? G.i + 1 : G.i] ?? G.route[G.route.length - 1] });
+      }
+    });
+    return out;
+  }
+
+  /**
+   * Every CHECK_EVERY minutes: can each group still reach its centre over
+   * open roads? (One breadth-first search from each centre.) Re-assign if a
+   * group has lost its centre, or a group without one could now reach one.
+   */
+  private checkAssignment(minute: number, live: (e: number) => number, time: (e: number) => number, risk: Float32Array | null): void {
+    const cands = this.candidates();
+    if (!cands.length) return;
+    const reach = this.slots.map((s) => this.reachSet(s.node, live));
+    const lost = new Set<number>();
+    let gain = false;
+    for (const { gi, node } of cands) {
+      const G = this.groups[gi];
+      if (node < 0) continue;
+      if (G.shelter >= 0) {
+        if (!reach[G.shelter][node]) lost.add(G.shelter);
+      } else {
+        // Without a centre: only worth re-planning if some centre with room
+        // has become reachable since the last plan (otherwise nothing changed).
+        let mask = 0;
+        this.slots.forEach((s, k) => {
+          if (reach[k][node] && s.capacity - s.load >= G.spec.size) mask |= 1 << k;
+        });
+        if (mask & ~G.reachMask) gain = true;
+      }
+    }
+    if (lost.size || gain) this.runAssignment(minute, live, time, risk, 'reassign', [...lost].sort((a, b) => a - b), reach);
+  }
+
+  private reachSet(source: number, cost: (e: number) => number): Uint8Array {
+    const g = this.g;
+    const seen = new Uint8Array(g.n);
+    const queue = [source];
+    seen[source] = 1;
+    for (let q = 0; q < queue.length; q++) {
+      const v = queue[q];
+      for (let i = g.adjStart[v]; i < g.adjStart[v + 1]; i++) {
+        const u = g.adjNode[i];
+        if (!seen[u] && Number.isFinite(cost(g.adjEdge[i]))) {
+          seen[u] = 1;
+          queue.push(u);
+        }
+      }
+    }
+    return seen;
+  }
+
+  private runAssignment(minute: number, live: (e: number) => number, time: (e: number) => number, risk: Float32Array | null, kind: AssignEvent['kind'], lostCentres: number[], reachIn?: Uint8Array[]): void {
+    const cands = this.candidates();
+    if (!cands.length) return;
+    // Remember which centres each group can reach now (see checkAssignment).
+    const reach = reachIn ?? this.slots.map((s) => this.reachSet(s.node, live));
+    for (const { gi, node } of cands) {
+      let mask = 0;
+      if (node >= 0) reach.forEach((r, k) => {
+        if (r[node]) mask |= 1 << k;
+      });
+      this.groups[gi].reachMask = mask;
+    }
+    // Places left = capacity minus the people who are not being re-planned.
+    const inPlan = new Set(cands.map((c) => c.gi));
+    const room = this.slots.map((s) => s.capacity);
+    this.groups.forEach((G, gi) => {
+      if (!inPlan.has(gi) && G.shelter >= 0) room[G.shelter] -= G.spec.size;
+    });
+    const groups: PlanGroup[] = cands.map(({ gi, node }) => ({ node, size: this.groups[gi].spec.size, hood: this.groups[gi].spec.hood, prefer: this.groups[gi].shelter }));
+    const out = planAssignment({ graph: this.g, shelterNodes: this.slots.map((s) => s.node), room, cost: live, time, risk, groups, seed: `${this.s.seed}::assign::${minute}`, lambda: this.s.lambda });
+    this.assignRuns++;
+    let moved = 0, movedPeople = 0;
+    cands.forEach(({ gi }, x) => {
+      const G = this.groups[gi];
+      const next = out.assign[x];
+      const before = G.shelter;
+      if (next === before) {
+        if (G.status === Status.Waiting && next >= 0) G.eta = G.spec.departAt + out.minutes[x];
+        return;
+      }
+      if (kind === 'reassign') {
+        moved++;
+        movedPeople += G.spec.size;
+      }
+      // Release the old place, book the new one.
+      if (before >= 0) this.slots[before].load -= G.spec.size;
+      G.shelter = next;
+      if (next >= 0) this.slots[next].load += G.spec.size;
+      if (G.status === Status.Waiting) {
+        G.eta = next >= 0 ? G.spec.departAt + out.minutes[x] : -1;
+        return;
+      }
+      if (next < 0) return;
+      // A group already out: head for the new centre.
+      if (G.status === Status.Stranded) {
+        G.status = Status.Moving;
+        G.route = [G.route[G.route.length - 1] ?? G.spec.node];
+        G.edges = [];
+        G.i = 0;
+        G.pos = 0;
+        this.plan(gi, minute, live, false);
+        return;
+      }
+      const k = G.pos > 0 ? G.i + 1 : G.i;
+      const from = G.route[k];
+      if (from === undefined) return;
+      const r = routeTo(this.g, from, this.slots[next].node, live, this.s.net.vmax);
+      if (!r.found) return;
+      G.route = G.route.slice(0, k).concat(r.path);
+      G.edges = G.edges.slice(0, k).concat(r.edges);
+      G.replans++;
+      G.lastSwitch = minute;
+      G.eta = minute + this.routeMinutes(G.edges, G.i);
+      this.markChanged(gi);
+    });
+    this.reassigned += moved;
+    this.events.push({
+      minute,
+      kind,
+      status: out.status,
+      why: out.why,
+      groups: cands.length,
+      people: out.people,
+      placed: out.placed,
+      cutOff: out.cutOff,
+      nodes: out.nodes,
+      backtracks: out.backtracks,
+      wipeouts: out.wipeouts,
+      energyCSP: out.energyCSP,
+      energySA: out.energySA,
+      moved,
+      movedPeople,
+      lostCentres,
+    });
   }
 
   /** Move a group for one minute along its route. */
@@ -370,7 +635,7 @@ export class AgentSim {
   // ─────────────── Read-outs ───────────────
 
   /** Positions for drawing: [x, y, status, size, shelter, replans] per group. */
-  positions(out: Float32Array = new Float32Array(this.groups.length * 6)): Float32Array {
+  positions(out: Float32Array = new Float32Array(this.groups.length * STRIDE)): Float32Array {
     const net = this.s.net;
     this.groups.forEach((G, gi) => {
       let x = 0, y = 0;
@@ -385,13 +650,15 @@ export class AgentSim {
         x = net.nodeX[node];
         y = net.nodeY[node];
       }
-      const o = gi * 6;
+      const o = gi * STRIDE;
       out[o] = x;
       out[o + 1] = y;
       out[o + 2] = G.status;
       out[o + 3] = G.spec.size;
       out[o + 4] = G.shelter;
       out[o + 5] = G.replans;
+      out[o + 6] = G.status === Status.Sheltered ? G.arrivedAt : G.eta;
+      out[o + 7] = G.arrivedAt;
     });
     return out;
   }
@@ -438,7 +705,7 @@ export class AgentSim {
     times.sort((a, b) => a - b);
     const mean = times.length ? times.reduce((a, b) => a + b, 0) / times.length : 0;
     const p95 = times.length ? times[Math.min(times.length - 1, Math.floor(times.length * 0.95))] : 0;
-    return { sheltered, enRoute, waiting, stranded, noAccess, meanMinutes: mean, p95Minutes: p95, replans, groups: this.groups.length };
+    return { sheltered, enRoute, waiting, stranded, noAccess, meanMinutes: mean, p95Minutes: p95, replans, groups: this.groups.length, assignRuns: this.assignRuns, reassigned: this.reassigned };
   }
 
   private pointOnEdge(e: number, from: number, dist: number): [number, number] {

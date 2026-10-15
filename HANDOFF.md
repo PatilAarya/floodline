@@ -30,8 +30,8 @@ The original brief is `flood-evacuation-claude-code-prompt.md`.
 | 4 Search + agents + re-planner + Algorithms race | done |
 | 5 Bayesian network | done |
 | 6 CSP + SA/HC (Assignment page) | done |
-| **7 Simulator integration** | **next** (much already exists, see section 5) |
-| 8 Experiments | todo |
+| 7 Simulator integration | done |
+| **8 Experiments** | **next** |
 | 9 Home narrative, Viva page, polish, docs | todo |
 | 10 Deploy-ready handoff | todo |
 
@@ -107,6 +107,15 @@ Versions installed: Vite 8, TypeScript 7, Vitest 5, Node 22. Windows machine (Po
 - Default numbers (dry, deadline 40, all centres): 178 groups, 411,000 people. FC+MRV(+degree+LCV) solves in 178 nodes; plain backtracking and BT+MRV run out of the 50k budget. Deadline 25-30: infeasible by counting. Level 1 m: 2 groups cut off, relaxed plan 406,900 = bound. SA (300k, geometric) ~9.48M vs steepest HC ~9.73M vs CSP 13.8M person-min; linear cooling is consistently worse (stays hot too long), said honestly on the page.
 - Page `pages/assignment.ts`: map with flow arcs hood -> centre (width ~ sqrt(people)), centre fill rings and load/capacity, hatched rings for people without a centre, tap a hood (where its people go) or a centre (close/reopen). Controls: water level, deadline, centre risk limit, capacity scale, close centres, FC/MRV/degree/LCV toggles. Auto re-solve on every change with warm start (`prefer`) and a diff list. If counting proves infeasibility the search is skipped. Compare-six-settings table + bar chart. Search tree lab: Mahim + Matunga West + Indira Nagar (12 groups), 4 nearest centres, deadline 18, capacity x1.15 (plain 152 nodes / 95 backtracks, FC 97 / 15 wipeouts, FC+MRV 12). Energy plot (x = moves evaluated, log temperature axis, uphill rug), comparison table and plan selector for the map.
 - Why that lab instance: with uniform 2,500-person groups, bigger instances are either trivial or symmetric-infeasible (exponential thrash even with FC). Restricted domains via the deadline produce the textbook "MRV/FC finds trouble near the root" effect.
+
+### Strategy 3 in the Simulator (phase 7: `src/sim/planner.ts`, `src/sim/agents.ts`)
+- Strategy id stays `risk` (URL `strategy=risk`), label "Risk-aware + CSP + SA".
+- `planner.ts` `planAssignment()`: one Dijkstra per centre on the live risk-aware cost (plain minutes + exposure along the same tree), domains = centres reachable within `PLAN_DEADLINE` 150 min with room, Hall check, FC+MRV+degree+LCV with a NODE budget only (`PLAN_NODES` 6000, `maxMs: Infinity`: a time budget would break determinism), else `maximisePartial`; then SA (`PLAN_SA_ITERATIONS` 40k, seed `${seed}::assign::${minute}`), kept only if better and not overloaded.
+- `AgentSim` (strategy risk): at `warningAt` (`WARNING_AT` = 45, `agentSetup.ts`) assigns and books every waiting group (`G.shelter` set while waiting); departure routes to the booked centre with A* (fallback: nearest centre with room). Every `CHECK_EVERY` = 10 min: BFS from each centre; re-assign if a group's centre is unreachable from its next junction, or a group without a centre gained a reachable centre since its last plan (`G.reachMask`). Re-assignment is warm-started (`prefer`) and the energy gets a change term (`CHANGE_COST` 30 person-min per person moved, `weights.change` + `model.prefer` in `objective.ts`; 0 on the Assignment page), which cut churn from ~100 groups to 1-11 per re-plan.
+- Snapshot includes `planned`, `assignRuns`, `reassigned`; a rewind replays identically (checked: positions and metrics equal after seek 230 -> 40 -> 230).
+- `positions()` stride is now `STRIDE` = 8 (exported from agents.ts): + eta, arrivedAt. `AgentLayer` has `bookedFor`, `raw()`.
+- Frames carry `assign: AssignEvent[]`; the page logs each once (dedupe key minute:kind; checks that moved nobody are not logged). Inspector: group (neighbourhood + number, leaves at, assigned centre, ETA free-flow, arrived), centre (booked), neighbourhood (groups, in a centre now, assigned centres). Water-level mode: "Cut off from every centre" (debounced `prepareNetwork`).
+- Numbers, 26 July 2005, seed mumbai, vehicles: grid 128: dynamic 406,000 sheltered, mean 38, p95 108; CSP+SA 406,000, mean 36, p95 80 (18 s). Grid 192: dynamic 422,500, 34 / 68; CSP+SA 422,500, 31 / 57. Naive 128: 298,600, 122 / 497 (unchanged). The older "risk-aware A* only" (phase 5) had p95 73 at 128; that strategy no longer exists separately.
 
 ### Tests (`tests/`)
 `world.test.ts` (synthetic connectivity/determinism), `flood.test.ts` (mass conservation x2, rewind determinism), `bayes.test.ts` (CPTs valid, enumeration == VE to 1e-9 on 7 evidence sets, impossible evidence, LW within 0.02 at 50k, d-separation cases + Bayes-ball == trail enumeration), `search.test.ts` (A* == UCS dry and flooded on Mumbai, admissible + consistent heuristic, BFS/DFS/Greedy never cheaper, clean failure), `csp.test.ts` (Australia 3-colouring under all 16 heuristic combos, K4 infeasible under all 16, capacity + Hall explanation + partial bound, node budget). Tests read `src/data/mumbai.json` with `fs`.

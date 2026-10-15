@@ -9,6 +9,12 @@
  *   Level     an instant "what if": drag the water-level slider and the flood
  *             rises or recedes immediately across connected low ground.
  * Either way, roads close and reopen as the water moves.
+ *
+ * Strategies: naive static routing, dynamic A* re-planning, and
+ * "risk-aware + CSP + SA": at the warning every group gets a centre from the
+ * constraint solver, improved by simulated annealing, then travels by
+ * risk-aware A*; the plan is re-run when a centre becomes unreachable.
+ * Assignments and re-assignments appear in the events log.
  */
 import { mumbaiNetwork, RAIN_STATES, RIVER_STATES, riverClass } from '../ai/bayes/cpt';
 import { prefs, setQuality, type Quality } from '../core/prefs';
@@ -17,8 +23,9 @@ import { replaceParams, type Page } from '../core/router';
 import { clamp, fmtClock, fmtInt, fmtMinutes, fmtNum, parseClamped, sanitizeSeed } from '../core/units';
 import { AgentLayer } from '../render/canvas/agents';
 import { hatchAlpha, hatchSpacing, RiskLayer } from '../render/canvas/risk';
-import { Status, type AgentMetrics, type Strategy } from '../sim/agents';
+import { Status, STRIDE, type AgentMetrics, type AssignEvent, type GroupSpec, type Strategy } from '../sim/agents';
 import { buildAgentSetup } from '../sim/agentSetup';
+import { allGroups, prepareNetwork } from '../sim/assignment';
 import { pickGaugeCell, type FrameMsg, type RiskFrame } from '../sim/floodEngine';
 import { FloodClient } from '../sim/floodClient';
 import { buildEdgeTable, buildFloodSetup, buildForcing, computeEdgeStates, floodStats, waterLevelFlood, type EdgeTable, type TravelMode } from '../sim/hydrology';
@@ -108,6 +115,13 @@ const page: Page = {
     let lastFrame: FrameMsg | null = null;
     let genToken = 0;
     const events: string[] = [];
+    /** Group specs of the running simulation (neighbourhood of each group). */
+    let groupSpecs: GroupSpec[] = [];
+    /** Assignment events already logged (a rewind replays them; log each once). */
+    const assignSeen = new Set<string>();
+    /** Water-level mode: demand that cannot reach any open centre. */
+    let levelCut: { people: number; hoods: string[] } | null = null;
+    let cutTimer: ReturnType<typeof setTimeout> | null = null;
     const quality = () => prefs.get().quality;
     const gridFor = (q: Quality) => (q === 'high' ? 256 : q === 'low' ? 128 : weakDevice() ? 128 : 192);
 
@@ -151,12 +165,13 @@ const page: Page = {
       options: [
         { value: 'naive', label: 'Naive static', hint: 'Plan once on the dry map; never re-plan; wait at closed roads' },
         { value: 'dynamic', label: 'Dynamic A*', hint: 'A* on live road states, re-plans when roads close' },
-        { value: 'risk', label: 'Risk-aware A*', hint: 'Dynamic A* that also avoids roads the Bayesian network rates likely to flood' },
+        { value: 'risk', label: 'Risk-aware + CSP + SA', hint: 'At the warning a constraint solver assigns every group a centre with room, simulated annealing improves the plan, and groups travel by risk-aware A*; the plan is re-run when a centre is cut off' },
       ],
       onChange: (st) => {
         strategy = st;
         lastReplans = 0;
         announcedDone = false;
+        assignSeen.clear();
         client?.send({ type: 'strategy', strategy: st });
         log(`Strategy changed to ${strategyWord(st)}; the run was recomputed from the start.`);
         syncURL();
@@ -431,6 +446,7 @@ const page: Page = {
 
     function setMode(m: Mode) {
       mode = m;
+      levelCut = null;
       stormGroup.hidden = m !== 'storm';
       levelGroup.hidden = m !== 'level';
       if (m === 'level') {
@@ -519,6 +535,7 @@ const page: Page = {
         }
         rows.push(['Highest flood risk', `${world.hoods[worst].name}, ${fmtNum(worstP, 2)}`], ['Demand in areas at 50%+ risk', fmtInt(over)]);
       }
+      if (mode === 'level' && levelCut) rows.push(['Cut off from every centre', levelCut.people ? `${fmtInt(levelCut.people)} people${levelCut.hoods.length ? ` (${listOf(levelCut.hoods)})` : ''}` : 'nobody']);
       liveFacts.replaceChildren(...rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
       map.setSummary(`${mode === 'storm' ? `At ${fmtClock(minute)}` : `Water at ${level.toFixed(1)} m`}: ${fmtNum(stats.floodedKm2, 1)} square kilometres flooded, ${stats.blocked} road segments closed, rain ${Math.round(stats.rain)} mm per hour.`);
     }
@@ -559,7 +576,7 @@ const page: Page = {
     function updateEvacuation(m: AgentMetrics, at: number, jump: boolean, p: Float32Array | null) {
       const total = m.sheltered + m.enRoute + m.waiting + m.stranded + m.noAccess;
       let stuck = 0;
-      if (p) for (let o = 0; o < p.length; o += 6) if (p[o + 2] === Status.Stuck) stuck += p[o + 3];
+      if (p) for (let o = 0; o < p.length; o += STRIDE) if (p[o + 2] === Status.Stuck) stuck += p[o + 3];
       evSheltered.textContent = fmtInt(m.sheltered);
       evStranded.textContent = fmtInt(stuck + m.stranded + m.noAccess);
       evFacts.replaceChildren(
@@ -573,6 +590,7 @@ const page: Page = {
           ['Mean trip (sheltered)', m.sheltered ? fmtMinutes(m.meanMinutes) : 'n/a'],
           ['95th percentile trip', m.sheltered ? fmtMinutes(m.p95Minutes) : 'n/a'],
           ['Re-plans so far', fmtInt(m.replans)],
+          ...(strategy === 'risk' ? ([['CSP + SA plans made', fmtInt(m.assignRuns)], ['Groups moved by re-assignment', fmtInt(m.reassigned)]] as [string, string][]) : []),
         ] as [string, string][]).flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)]),
       );
       if (!jump && m.replans - lastReplans >= 3) log(`${m.replans - lastReplans} groups re-planned around closed roads at ${fmtClock(at)}.`);
@@ -597,6 +615,8 @@ const page: Page = {
       map.setDepth(f.depth, f.flow, { reset: jump, intervalMs: frameInterval });
       agentLayer.setPositions(f.agents, !jump, world?.shelters.length ?? 0);
       if (f.metrics) updateEvacuation(f.metrics, f.minute, jump, f.agents);
+      for (const a of f.assign) logAssign(a);
+      if (currentSel && (currentSel.kind === 'group' || currentSel.kind === 'shelter') && f.minute !== lastMinute) showInspector(currentSel, false);
       map.setEdgeState(f.edgeState);
       map.setRain(clamp(f.stats.rain / 120, 0, 1));
       applyRiskFrame(f.risk, jump, prev?.risk ?? null);
@@ -614,6 +634,27 @@ const page: Page = {
       lagNote.textContent = f.lagging ? 'This device cannot keep up with this speed; the simulation is running as fast as it can.' : '';
       status.hidden = true;
       requestAnimationFrame(() => client?.send({ type: 'ack' }));
+    }
+
+    /** A CSP + SA assignment from the engine, in plain words (each logged once). */
+    function logAssign(a: AssignEvent) {
+      const key = `${a.minute}:${a.kind}`;
+      if (assignSeen.has(key) || !world) return;
+      assignSeen.add(key);
+      const w = world;
+      const when = fmtClock(a.minute);
+      const gain = a.energyCSP > 0 ? Math.round(((a.energyCSP - a.energySA) / a.energyCSP) * 100) : 0;
+      const sa = gain > 0 ? ` Simulated annealing then cut the plan's cost (travel time, flood exposure, crowding) by ${gain}%.` : '';
+      const short = a.status === 'relaxed' ? ` No plan could place everyone (${a.why}); the relaxed plan places ${fmtInt(a.placed)} of ${fmtInt(a.people)} people.` : '';
+      if (a.kind === 'initial') {
+        log(`Evacuation warning at ${when}. ${a.status === 'solved' ? `The constraint solver gave all ${a.groups} groups (${fmtInt(a.people)} people) a relief centre with room, in ${fmtInt(a.nodes)} search nodes.` : 'The constraint solver could not give every group a centre.'}${short}${sa}`);
+        return;
+      }
+      // A check that changed nothing is not news.
+      if (!a.moved && !a.lostCentres.length) return;
+      const centres = a.lostCentres.map((i) => w.shelters[i]?.name ?? `S${i + 1}`);
+      const trigger = centres.length ? `${listOf(centres)} can no longer be reached by some groups` : 'roads reopened for groups that had no centre';
+      log(`Re-assignment at ${when}: ${trigger}. ${a.moved ? `${a.moved} group${a.moved > 1 ? 's' : ''} (${fmtInt(a.movedPeople)} people) were given ${centres.length ? 'another' : 'a'} centre` : 'No group had to change centre'}; the rest kept their places.${short}`);
     }
 
     function setHoodDist(dist: Float32Array | null) {
@@ -689,7 +730,28 @@ const page: Page = {
         setHoodDist(hoodRisk(rs, riskPosterior(net, -1, river)));
       }
       const fs = floodStats(w, depth);
-      updateFigures({ rain: 0, floodedKm2: fs.floodedKm2, blocked: es.blocked, degraded: es.degraded, maxDepth: fs.maxDepth });
+      const stats = { rain: 0, floodedKm2: fs.floodedKm2, blocked: es.blocked, degraded: es.degraded, maxDepth: fs.maxDepth };
+      updateFigures(stats);
+      // Which neighbourhoods can still reach a relief centre (debounced: one
+      // shortest-path search per centre, so not on every slider pixel).
+      if (cutTimer) clearTimeout(cutTimer);
+      const at = level;
+      cutTimer = setTimeout(() => {
+        cutTimer = null;
+        if (signal.aborted || mode !== 'level' || !world || !table || at !== level) return;
+        const prep = prepareNetwork(world, level, travel, table);
+        let people = 0;
+        const hoods = new Set<string>();
+        for (const g of allGroups(world)) {
+          const ok = g.node >= 0 && prep.timeTo.some((t, s) => !prep.centreFlooded[s] && Number.isFinite(t[g.node]));
+          if (!ok) {
+            people += g.size;
+            hoods.add(world.hoods[g.hood].name);
+          }
+        }
+        levelCut = { people, hoods: [...hoods] };
+        updateFigures(stats);
+      }, 160);
     }
 
     function startClient(w: World) {
@@ -738,7 +800,10 @@ const page: Page = {
       const gaugeCell = pickGaugeCell(w);
       riskSetup = buildRiskSetup(w, sp.seed, gaugeCell);
       lastRisk = null;
-      c.send({ type: 'init', setup, forcing: buildForcing(sp), edges: table!, ground: w.ground, gaugeCell, mode: travel, notLand, agents: buildAgentSetup(w, strategy, travel), risk: riskSetup });
+      const agents = buildAgentSetup(w, strategy, travel, 2, sp.seed);
+      groupSpecs = agents.groups;
+      assignSeen.clear();
+      c.send({ type: 'init', setup, forcing: buildForcing(sp), edges: table!, ground: w.ground, gaugeCell, mode: travel, notLand, agents, risk: riskSetup });
       if (sp.rainScale !== 1) c.send({ type: 'rain', scale: sp.rainScale });
       renderStormInfo();
     }
@@ -823,17 +888,45 @@ const page: Page = {
             ['Evidence', `${hd.drainageClass} drains, ${hd.meanElev < 5 ? 'low' : hd.meanElev < 9 ? 'mid' : 'high'} ground${evid}`],
           );
         }
+        // Where this neighbourhood's groups are going (storm mode).
+        const p = agentLayer.raw();
+        if (mode === 'storm' && p && groupSpecs.length * STRIDE === p.length) {
+          const per = new Map<number, number>();
+          let n = 0, safe = 0, none = 0;
+          groupSpecs.forEach((g, gi) => {
+            if (g.hood !== sel.id) return;
+            n++;
+            const o = gi * STRIDE, sh = p[o + 4];
+            if (p[o + 2] === Status.Sheltered) safe += g.size;
+            if (sh >= 0) per.set(sh, (per.get(sh) ?? 0) + g.size);
+            else none += g.size;
+          });
+          if (n) {
+            rows.push(['Evacuee groups', String(n)], ['In a centre now', fmtInt(safe)]);
+            const list = [...per].sort((a, b) => b[1] - a[1]).map(([sh, ppl]) => `S${sh + 1} ${fmtInt(ppl)}`);
+            rows.push([strategy === 'risk' ? 'Assigned centres' : 'Heading for', list.length ? list.join(', ') : 'not decided yet']);
+            if (none && per.size) rows.push(['No centre yet', fmtInt(none)]);
+          }
+        }
       } else if (sel.kind === 'group') {
         const gr = agentLayer.group(sel.id);
-        title = `Evacuee group ${sel.id + 1}`;
+        const spec = groupSpecs[sel.id];
+        const hoodName = spec ? w.hoods[spec.hood]?.name : undefined;
+        const k = spec ? groupSpecs.slice(0, sel.id + 1).filter((g) => g.hood === spec.hood).length : 0;
+        title = hoodName ? `${hoodName}, group ${k}` : `Evacuee group ${sel.id + 1}`;
         if (gr) {
           const statusWord = ['waiting to leave', 'on the move', 'in a relief centre', 'no reachable centre', 'waiting at a closed road', 'turning back from a flooded road', 'no road access'][gr.status] ?? 'unknown';
-          rows.push(['People', fmtInt(gr.size)], ['Status', statusWord], ['Heading for', gr.shelter >= 0 ? w.shelters[gr.shelter].name : 'nowhere yet'], ['Re-plans', String(gr.replans)]);
+          rows.push(['People', fmtInt(gr.size)], ['Status', statusWord]);
+          if (spec) rows.push(['Leaves at', fmtClock(spec.departAt)]);
+          rows.push([gr.status === Status.Sheltered ? 'In' : strategy === 'risk' ? 'Assigned centre' : 'Heading for', gr.shelter >= 0 ? w.shelters[gr.shelter].name : 'none yet']);
+          if (gr.status === Status.Sheltered && gr.arrivedAt >= 0) rows.push(['Arrived', fmtClock(gr.arrivedAt)]);
+          else if (gr.eta >= 0 && gr.shelter >= 0) rows.push(['Expected arrival', `${fmtClock(gr.eta)}${gr.eta > minute ? `, in ${fmtMinutes(gr.eta - minute)}` : ''} (free-flow estimate)`]);
+          rows.push(['Re-plans', String(gr.replans)]);
         }
       } else if (sel.kind === 'shelter') {
         const s = w.shelters[sel.id];
         title = s.name;
-        rows.push(['Capacity', `${fmtInt(s.capacity)} people`], ['Inside now', fmtInt(agentLayer.occupancyOf(s.id))], ['Elevation', `${fmtNum(s.elev, 1)} m`], ['Junction', `J${s.node}`], ['Ground', s.lowGround ? 'fairly low: may be cut off' : 'high']);
+        rows.push(['Capacity', `${fmtInt(s.capacity)} people`], ['Inside now', fmtInt(agentLayer.occupancyOf(s.id))], [strategy === 'naive' ? 'Heading here' : 'Booked, on the way or not left', fmtInt(agentLayer.bookedFor(s.id))], ['Elevation', `${fmtNum(s.elev, 1)} m`], ['Junction', `J${s.node}`], ['Ground', s.lowGround ? 'fairly low: may be cut off' : 'high']);
       } else {
         const e = w.graph.edges[sel.id];
         const kindWord = { road: e.cls === 'arterial' ? 'main road' : 'road', bridge: 'bridge over water', flyover: 'flyover', tunnel: 'subway / underpass' }[e.kind];
@@ -884,6 +977,7 @@ const page: Page = {
     return () => {
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('visibilitychange', onVis);
+      if (cutTimer) clearTimeout(cutTimer);
       client?.dispose();
       map.destroy();
       scrubber.destroy();
@@ -893,7 +987,7 @@ const page: Page = {
 };
 
 function strategyWord(s: Strategy): string {
-  return { naive: 'naive static routing', dynamic: 'dynamic A* re-planning', risk: 'risk-aware A*' }[s];
+  return { naive: 'naive static routing', dynamic: 'dynamic A* re-planning', risk: 'risk-aware A* with CSP + SA assignment' }[s];
 }
 
 function listOf(items: string[]): string {
