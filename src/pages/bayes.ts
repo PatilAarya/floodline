@@ -86,7 +86,7 @@ const page: Page = {
     const nodeTitle = h('h3', { class: 'bn-node-title' });
     const nodeAbout = h('p', { class: 'small muted' });
     const evidenceHost = h('div');
-    const nodeTable = h('div');
+    const nodeTable = h('div', { class: 'table-scroll' });
     const methodNote = h('p', { class: 'small muted' });
     const sceneCtl = createSegmented<string>({
       label: 'Gauge readings',

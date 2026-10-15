@@ -51,6 +51,8 @@ export interface MapViewOptions {
   hitExtra?: (sx: number, sy: number) => Selection;
   /** Raw tap in world coordinates; return true to skip normal selection. */
   onTap?: (wx: number, wy: number) => boolean;
+  /** false: a decorative backdrop (home page): no pointer, wheel or keyboard handling, hidden from assistive tech. */
+  interactive?: boolean;
 }
 
 export interface MapView {
@@ -71,6 +73,8 @@ export interface MapView {
   setAnimating(on: boolean): void;
   setSummary(text: string): void;
   requestRender(): void;
+  /** Redraw everything, including the cached layers (after moving the camera in code). */
+  redraw(): void;
   destroy(): void;
 }
 
@@ -82,7 +86,14 @@ export function createMapView(o: MapViewOptions): MapView {
   const summary = h('p', { class: 'visually-hidden', 'aria-live': 'polite' });
   const hint = h('p', { class: 'map-hint', 'aria-hidden': 'true' }, 'Drag to pan, scroll or pinch to zoom, tap to inspect. Keys: arrows, + and -, 0 to reset.');
   const credit = h('p', { class: 'map-credit' });
-  const el = h('div', { class: 'map-view' }, baseGL, base2D, stat, dyn, hint, credit, summary);
+  const interactive = o.interactive !== false;
+  const el = h('div', { class: interactive ? 'map-view' : 'map-view map-passive' }, baseGL, base2D, stat, dyn, hint, credit, summary);
+  if (!interactive) {
+    dyn.removeAttribute('tabindex');
+    dyn.removeAttribute('role');
+    dyn.setAttribute('aria-hidden', 'true');
+    hint.hidden = true;
+  }
   const cam = new Camera();
 
   let gl: FloodGL | null = FloodGL.create(baseGL);
@@ -322,7 +333,7 @@ export function createMapView(o: MapViewOptions): MapView {
     return null;
   };
 
-  const detach = attachCameraControls(dyn, cam, {
+  const detach = !interactive ? () => {} : attachCameraControls(dyn, cam, {
     onChange: invalidate,
     onTap(wx, wy, sx, sy) {
       if (o.onTap?.(wx, wy)) {
@@ -438,6 +449,7 @@ export function createMapView(o: MapViewOptions): MapView {
       dyn.setAttribute('aria-label', `${o.label}. ${text}`);
     },
     requestRender,
+    redraw: invalidate,
     destroy() {
       cancelAnimationFrame(raf);
       detach();

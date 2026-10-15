@@ -32,8 +32,8 @@ The original brief is `flood-evacuation-claude-code-prompt.md`.
 | 6 CSP + SA/HC (Assignment page) | done |
 | 7 Simulator integration | done |
 | 8 Experiments | done |
-| **9 Home narrative, Viva page, polish, docs** | **next** |
-| 10 Deploy-ready handoff | todo |
+| 9 Home narrative, Viva page, polish, docs | done |
+| **10 Deploy-ready handoff** | **next** |
 
 Current numbers (26 July 2005 storm, default seed `mumbai`, 128 grid, vehicles):
 naive static 298,600 sheltered / 112,400 stuck, mean trip 122 min, p95 497;
@@ -123,6 +123,13 @@ Versions installed: Vite 8, TypeScript 7, Vitest 5, Node 22. Windows machine (Po
 - `ExperimentPool`: `defaultWorkerCount()` = cores - 1, max 6; each worker builds the world once, then takes seeds one at a time; progress every 30 sim-minutes; `cancel()` terminates all. No-worker fallback runs seeds inline with pauses.
 - Page: seeds slider (5-100, default 50; seed 1 = `mumbai`, others `run-N`), storm preset or "all four in turn", travel mode, Run / Cancel / Download CSV (long format: one row per seed x strategy). Live progress bar with ETA. Results stream in: three big figures (mean % sheltered), conclusion with exact sign tests (`src/core/stats.ts`), paired per-seed chart, two difference strips, five box/strip plots, summary table (mean, sd, median, worst). Charts in `src/ui/charts/strip.ts` encode strategies by marker shape (open circle naive, open square dynamic, filled diamond CSP+SA). The last run is kept in a module variable (lost on reload or HMR).
 - Default run (50 storms, 26 July 2005 shape, vehicles, 5 workers on a 12-core machine): 6 min 33 s. Mean share sheltered: naive 69.7%, dynamic 97.9%, CSP+SA 97.9%. CSP+SA sheltered more than naive in 50/50 storms (+115,978 people on average, sign test p < 0.001). Against dynamic: more in 1, fewer in 3, same in 46; p95 shorter in 40, longer in 8 (mean p95 147 vs 169 min, median 76 vs 77, p < 0.001). Mean trip 38.4 vs 40.1 (naive 113.6). Minutes to 90% sheltered: 273 vs 304 (naive never). Use these honestly in the viva: the CSP+SA gain over dynamic A* is speed and the worst-case tail, not the number sheltered.
+
+### Home, Viva, polish (phase 9)
+- `docs/VIVA.md` is the single source of the viva notes; `pages/viva.ts` imports it with `?raw` and renders it with the hand-written `src/ui/markdown.ts` (headings, paragraphs, lists, fenced code, tables, inline code/bold/em/links; everything HTML-escaped). Each `##` becomes a section (`id="viva-<slug>"`), with a sticky contents list, a filter box and deep links `#/viva?topic=<slug>`. Edit the Markdown, the page follows. Experiment numbers in it come from the 50-storm run (section 3, phase 8 notes).
+- Home (`pages/home.ts`): a passive `MapView` (new option `interactive: false`: no pointer/wheel/keyboard, aria-hidden; plus `redraw()` for camera moves in code) in a sticky stage behind 5 scroll chapters: levels 0.6 / 1.2 / 1.6 / 2.0 / 2.0 m (`PLAN_LEVEL` = 2), rain streaks, BN risk hatching (rain gauge heavy + river from level), closed roads, then a CSP + SA plan at 2 m drawn as arcs. All numbers are computed live (at 2 m: 365 closed segments incl. 9 bridge spans, 172,500 people cut off; the plan places 238,500 of 411,000). Water moves in 0.1 m steps every 110 ms; camera drifts slowly; reduced motion = jumps, no drift, no rain. Chapters are chosen by a passive scroll listener (not IntersectionObserver). Framing: basin centre at 66% width on wide screens; on narrow screens the map covers the stage and text sits on a bottom scrim.
+- OG image: `scripts/og/og.html` (tokens + self-hosted fonts) rendered by `npm run og` (`scripts/make-og.mjs`, local headless Chrome/Edge, no downloads) to `public/og.png` 1200x630. `index.html` has og:image size/alt and twitter:card. OG image URLs must become absolute after deploy (phase 10 checklist).
+- Polish: hidden `h1` on the Simulator; Bayes node table scrolls instead of widening the page; long inline code wraps on the Viva page. Every page checked at 320 and 375 px: no horizontal overflow, one h1, no console errors. `comingInPhase` placeholder removed.
+- Hidden Browser pane gotcha, wider than rAF: ResizeObserver, IntersectionObserver and scroll events also do not fire while hidden. Dispatch `scroll` by hand when testing; a screenshot forces a render (and ResizeObserver).
 
 ### Tests (`tests/`)
 `world.test.ts` (synthetic connectivity/determinism), `flood.test.ts` (mass conservation x2, rewind determinism), `bayes.test.ts` (CPTs valid, enumeration == VE to 1e-9 on 7 evidence sets, impossible evidence, LW within 0.02 at 50k, d-separation cases + Bayes-ball == trail enumeration), `search.test.ts` (A* == UCS dry and flooded on Mumbai, admissible + consistent heuristic, BFS/DFS/Greedy never cheaper, clean failure), `csp.test.ts` (Australia 3-colouring under all 16 heuristic combos, K4 infeasible under all 16, capacity + Hall explanation + partial bound, node budget). Tests read `src/data/mumbai.json` with `fs`.

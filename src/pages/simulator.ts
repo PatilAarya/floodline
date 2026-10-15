@@ -430,7 +430,7 @@ const page: Page = {
     const notes = h('section', { class: 'rail-section' }, h('h2', null, 'About this map'), notesList);
 
     const rail = h('aside', { class: 'rail', 'aria-label': 'Flood controls and map information' }, control, live, evacSec, eventsSec, inspector, city, layers, legend, notes);
-    root.append(h('div', { class: 'map-layout' }, mapWrap, rail));
+    root.append(h('h1', { class: 'visually-hidden' }, 'Simulator: a storm over the Mithi River basin, Mumbai'), h('div', { class: 'map-layout' }, mapWrap, rail));
     const sheet = makeSheet(rail, 'Controls');
 
     // ── Helpers ──

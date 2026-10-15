@@ -4,7 +4,7 @@ College AI mini project (viva-defended): a front-end-only dynamic flood evacuati
 Full original brief: `flood-evacuation-claude-code-prompt.md` (the source of truth if anything here is ambiguous).
 
 ## Current status (read first)
-Phases 1-8 are done (plus the Mumbai/light-theme scope change). **Next: phase 9 (Home narrative, Viva page, polish, a11y, OG image, docs/VIVA.md).**
+Phases 1-9 are done (plus the Mumbai/light-theme scope change). **Next: phase 10 (deploy-ready handoff: README.md, DEPLOY.md, final checklist; do not deploy).**
 `HANDOFF.md` has the full state, the architecture as built, gotchas, and the detailed plan for phases 6-10. Read it before starting.
 
 ## Hard rules
