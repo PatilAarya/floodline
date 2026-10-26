@@ -51,8 +51,8 @@ export interface MapViewOptions {
   hitExtra?: (sx: number, sy: number) => Selection;
   /** Raw tap in world coordinates; return true to skip normal selection. */
   onTap?: (wx: number, wy: number) => boolean;
-  /** false: a decorative backdrop (home page): no pointer, wheel or keyboard handling, hidden from assistive tech. */
-  interactive?: boolean;
+  /** The help line in the corner (defaults to the pan / zoom / tap help). */
+  hint?: string;
 }
 
 export interface MapView {
@@ -84,16 +84,9 @@ export function createMapView(o: MapViewOptions): MapView {
   const stat = h('canvas', { class: 'map-canvas', 'aria-hidden': 'true' });
   const dyn = h('canvas', { class: 'map-canvas map-input', tabindex: 0, role: 'img', 'aria-label': o.label });
   const summary = h('p', { class: 'visually-hidden', 'aria-live': 'polite' });
-  const hint = h('p', { class: 'map-hint', 'aria-hidden': 'true' }, 'Drag to pan, scroll or pinch to zoom, tap to inspect. Keys: arrows, + and -, 0 to reset.');
+  const hint = h('p', { class: 'map-hint', 'aria-hidden': 'true' }, o.hint ?? 'Drag to pan, scroll or pinch to zoom, tap to inspect. Keys: arrows, + and -, 0 to reset.');
   const credit = h('p', { class: 'map-credit' });
-  const interactive = o.interactive !== false;
-  const el = h('div', { class: interactive ? 'map-view' : 'map-view map-passive' }, baseGL, base2D, stat, dyn, hint, credit, summary);
-  if (!interactive) {
-    dyn.removeAttribute('tabindex');
-    dyn.removeAttribute('role');
-    dyn.setAttribute('aria-hidden', 'true');
-    hint.hidden = true;
-  }
+  const el = h('div', { class: 'map-view' }, baseGL, base2D, stat, dyn, hint, credit, summary);
   const cam = new Camera();
 
   let gl: FloodGL | null = FloodGL.create(baseGL);
@@ -333,7 +326,7 @@ export function createMapView(o: MapViewOptions): MapView {
     return null;
   };
 
-  const detach = !interactive ? () => {} : attachCameraControls(dyn, cam, {
+  const detach = attachCameraControls(dyn, cam, {
     onChange: invalidate,
     onTap(wx, wy, sx, sy) {
       if (o.onTap?.(wx, wy)) {

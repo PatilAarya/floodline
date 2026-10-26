@@ -1,17 +1,17 @@
 /**
- * The flood engine: owns a FloodModel (and optionally the evacuee agents)
+ * The flood engine: owns a FloodModel
  * and runs playback, keyframes and seeking. It talks only through
  * `post(message, transfer)`, so the same code runs inside the Web Worker
  * (floodWorker.ts) or, if workers are unavailable, on the main thread.
  *
  * Time model
  *   Everything advances in whole minutes: first the water, then road states,
- *   then the agents. Playback at speed s means s simulated minutes per
+ *   then the flood risk. Playback at speed s means s simulated minutes per
  *   wall-clock second. If the CPU cannot keep up, the engine runs as fast as
  *   it can and says so (`lagging`).
  *
  * Scrubbing
- *   A full keyframe (water, pipe fluxes, agents) is stored every KEY_EVERY
+ *   A full keyframe (water and pipe fluxes) is stored every KEY_EVERY
  *   minutes. Seeking back restores the nearest keyframe at or before the
  *   target and recomputes forward, which gives identical results because
  *   the whole system is deterministic minute by minute.
@@ -19,13 +19,12 @@
  * Live changes
  *   Rain slider: an override from the current minute on; keyframes after it
  *   are discarded (the future changed, the past did not).
- *   Tide, drains, travel mode, strategy: these apply from the start, so the
+ *   Tide, drains, travel mode: these apply from the start, so the
  *   run is recomputed from minute 0 up to the current minute.
  */
 import { mumbaiNetwork } from '../ai/bayes/cpt';
 import type { Network } from '../ai/bayes/network';
 import { riskFromDepth } from '../ai/search/cost';
-import { AgentSim, type AgentMetrics, type AgentSetup, type AgentSnapshot, type AssignEvent, type Strategy } from './agents';
 import { computeEdgeStates, type EdgeTable, type TravelMode } from './hydrology';
 import { FloodModel, type FloodSetup, type FloodState, type Forcing } from './floodModel';
 import { edgeRisk, hoodRisk, READ_EVERY, readGauges, riskPosterior, type RiskPosterior, type RiskReadings, type RiskSetup } from './riskModel';
@@ -43,7 +42,6 @@ export interface InitMsg {
   mode: TravelMode;
   /** For flood stats: sea + channel mask (1 = not land). */
   notLand: Uint8Array;
-  agents?: AgentSetup;
   /** Bayesian-network flood risk inputs. Without it, road risk falls back to a depth proxy. */
   risk?: RiskSetup;
 }
@@ -58,7 +56,6 @@ export type InMsg =
   | { type: 'rain'; scale: number }
   | { type: 'forcing'; tideOffset: number; drainScale: number }
   | { type: 'mode'; mode: TravelMode }
-  | { type: 'strategy'; strategy: Strategy }
   | { type: 'ack' }
   | { type: 'dispose' };
 
@@ -95,31 +92,18 @@ export interface FrameMsg {
   edgeState: Uint8Array;
   edgeDepth: Float32Array;
   stats: FrameStats;
-  /** [x, y, status, size, shelter, replans] per group, if agents are on. */
-  agents: Float32Array | null;
-  metrics: AgentMetrics | null;
   /** Bayesian risk, if the risk model is on. */
   risk: RiskFrame | null;
   /** P_flood per road segment (BN + water on the road), fed to risk-aware A*. */
   edgeRisk: Float32Array;
-  /** CSP + SA (re-)assignments since the previous frame (strategy risk). */
-  assign: AssignEvent[];
   computed: number;
   playing: boolean;
   lagging: boolean;
 }
 
-export interface RoutesMsg {
-  type: 'routes';
-  ids: Int32Array;
-  offsets: Int32Array;
-  nodes: Int32Array;
-}
-
 export type OutMsg =
   | { type: 'ready'; duration: number }
   | FrameMsg
-  | RoutesMsg
   | { type: 'series'; from: number; stage: Float32Array; flooded: Float32Array }
   /** Drop hydrograph samples from minute `keep` on (the future changed). */
   | { type: 'seriesTruncate'; keep: number }
@@ -130,13 +114,11 @@ type Post = (m: OutMsg, transfer?: Transferable[]) => void;
 
 interface Keyframe {
   flood: FloodState;
-  agents: AgentSnapshot | null;
 }
 
 export class FloodEngine {
   private post: Post;
   private model: FloodModel | null = null;
-  private agents: AgentSim | null = null;
   private init: InitMsg | null = null;
   private keyframes = new Map<number, Keyframe>();
   private computed = 0;
@@ -161,8 +143,6 @@ export class FloodEngine {
   private seriesSent = 0;
   private duration = 0;
   private dev = false;
-  /** Assignment events computed but not yet sent. */
-  private pendingAssign: AssignEvent[] = [];
 
   constructor(post: Post, dev = false) {
     this.post = post;
@@ -205,11 +185,6 @@ export class FloodEngine {
           break;
         case 'mode':
           this.mode = m.mode;
-          if (this.init?.agents) this.rebuildAgents({ ...this.init.agents, mode: m.mode });
-          this.recomputeFromStart();
-          break;
-        case 'strategy':
-          if (this.init?.agents) this.rebuildAgents({ ...this.init.agents, strategy: m.strategy });
           this.recomputeFromStart();
           break;
         case 'ack':
@@ -219,7 +194,6 @@ export class FloodEngine {
         case 'dispose':
           this.setPlaying(false);
           this.model = null;
-          this.agents = null;
           this.keyframes.clear();
           break;
       }
@@ -233,7 +207,6 @@ export class FloodEngine {
     this.init = m;
     this.mode = m.mode;
     this.model = new FloodModel(m.setup, m.forcing);
-    this.agents = m.agents ? new AgentSim(m.agents) : null;
     this.edgeState = new Uint8Array(m.edges.count);
     this.edgeDepth = new Float32Array(m.edges.count);
     this.risk = new Float32Array(m.edges.count);
@@ -244,22 +217,14 @@ export class FloodEngine {
     this.emitFrame(true);
   }
 
-  private rebuildAgents(setup: AgentSetup): void {
-    if (!this.init) return;
-    this.init = { ...this.init, agents: setup };
-    this.agents = new AgentSim(setup);
-  }
-
   private resetHistory(): void {
     const m = this.model!;
     this.keyframes.clear();
     this.readings = null;
     this.posterior = null;
-    this.pendingAssign = [];
     m.reset();
-    this.agents?.reset();
     this.updateRoads();
-    this.keyframes.set(0, { flood: m.snapshot(), agents: this.agents?.snapshot() ?? null });
+    this.keyframes.set(0, { flood: m.snapshot() });
     this.computed = 0;
     this.stage = [];
     this.flooded = [];
@@ -353,12 +318,7 @@ export class FloodEngine {
       if (bad) throw new Error(bad);
     }
     this.updateRoads();
-    if (this.agents) {
-      this.agents.step(m.minute, this.edgeState, this.edgeDepth, this.risk);
-      const ev = this.agents.takeEvents();
-      if (ev.length) this.pendingAssign.push(...ev);
-    }
-    if (m.minute % KEY_EVERY === 0 && !this.keyframes.has(m.minute)) this.keyframes.set(m.minute, { flood: m.snapshot(), agents: this.agents?.snapshot() ?? null });
+    if (m.minute % KEY_EVERY === 0 && !this.keyframes.has(m.minute)) this.keyframes.set(m.minute, { flood: m.snapshot() });
     if (m.minute > this.computed) {
       this.computed = m.minute;
       this.recordSeries();
@@ -396,8 +356,6 @@ export class FloodEngine {
       if (best > m.minute || target < m.minute) {
         const kf = this.keyframes.get(best)!;
         m.restore(kf.flood);
-        if (this.agents && kf.agents) this.agents.restore(kf.agents);
-        this.pendingAssign = [];
         this.updateRoads();
       }
     }
@@ -461,20 +419,14 @@ export class FloodEngine {
       substeps: m.lastSubsteps,
     };
     this.flushSeries();
-    const routes = this.agents?.takeRouteChanges();
-    if (routes) this.post({ type: 'routes', ...routes }, [routes.ids.buffer, routes.offsets.buffer, routes.nodes.buffer]);
-    const agents: Float32Array | null = this.agents ? this.agents.positions() : null;
-    const assign = this.pendingAssign;
-    this.pendingAssign = [];
     let risk: RiskFrame | null = null;
     if (init.risk && this.posterior && this.readings) {
       risk = { readings: { ...this.readings }, pRain: Array.from(this.posterior.pRain), pRiver: Array.from(this.posterior.pRiver), hood: hoodRisk(init.risk, this.posterior) };
     }
     const transfer: Transferable[] = [depth.buffer, flow.buffer, edgeState.buffer, edgeDepth.buffer, edgeRiskOut.buffer];
     if (risk) transfer.push(risk.hood.buffer);
-    if (agents) transfer.push(agents.buffer);
     this.post(
-      { type: 'frame', minute: t, depth, flow, edgeState, edgeDepth, stats, agents, metrics: this.agents?.metrics() ?? null, risk, edgeRisk: edgeRiskOut, assign, computed: this.computed, playing: this.playing, lagging: this.lagging },
+      { type: 'frame', minute: t, depth, flow, edgeState, edgeDepth, stats, risk, edgeRisk: edgeRiskOut, computed: this.computed, playing: this.playing, lagging: this.lagging },
       transfer,
     );
   }

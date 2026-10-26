@@ -1,1009 +1,799 @@
 /**
- * Simulator: the real Mumbai map (Mithi River basin) under a storm.
+ * Simulator: one trip through the flood, explained.
  *
- * Two ways to flood it:
- *   Storm     the physical model runs in a worker: rain, tide, drains and the
- *             upstream Mithi inflow move water across the terrain. Play, pause,
- *             change speed, drag the timeline back and forth, and move the rain
- *             slider while it runs.
- *   Level     an instant "what if": drag the water-level slider and the flood
- *             rises or recedes immediately across connected low ground.
- * Either way, roads close and reopen as the water moves.
+ *   1. Pick a start and a destination (click the map, or a preset trip).
+ *   2. The chosen search algorithm finds the best route on the dry roads.
+ *      The junctions it explored light up, in order, so you can see HOW it
+ *      searched; two alternative routes are shown dashed, with their times.
+ *   3. Start the storm. The real flood model runs; roads close as the water
+ *      rises. When a road on the route closes, the map marks where and why,
+ *      the old route is crossed out, and the algorithm re-plans from where
+ *      the car is (or from the start, before it leaves).
+ *   4. The car leaves at the chosen time and drives the current best route.
  *
- * Strategies: naive static routing, dynamic A* re-planning, and
- * "risk-aware + CSP + SA": at the warning every group gets a centre from the
- * constraint solver, improved by simulated annealing, then travels by
- * risk-aware A*; the plan is re-run when a centre becomes unreachable.
- * Assignments and re-assignments appear in the events log.
+ * Everything that decides is in src/sim/journey.ts (pure); this page only
+ * draws it and narrates it.
  */
-import { mumbaiNetwork, RAIN_STATES, RIVER_STATES, riverClass } from '../ai/bayes/cpt';
-import { prefs, setQuality, type Quality } from '../core/prefs';
-import { randomSeedString } from '../core/rng';
+import { prefs } from '../core/prefs';
 import { replaceParams, type Page } from '../core/router';
-import { clamp, fmtClock, fmtInt, fmtMinutes, fmtNum, parseClamped, sanitizeSeed } from '../core/units';
-import { AgentLayer } from '../render/canvas/agents';
-import { hatchAlpha, hatchSpacing, RiskLayer } from '../render/canvas/risk';
-import { Status, STRIDE, type AgentMetrics, type AssignEvent, type GroupSpec, type Strategy } from '../sim/agents';
-import { buildAgentSetup } from '../sim/agentSetup';
-import { allGroups, prepareNetwork } from '../sim/assignment';
-import { pickGaugeCell, type FrameMsg, type RiskFrame } from '../sim/floodEngine';
+import { clamp, fmtClock, fmtInt, fmtMinutes, fmtNum, parseClamped } from '../core/units';
+import { shelterGlyph } from '../render/canvas/overlays';
+import type { DrawCtx } from '../render/canvas/types';
+import { FONT_MONO } from '../render/canvas/types';
+import { css, mix, type Palette } from '../render/theme';
 import { FloodClient } from '../sim/floodClient';
-import { buildEdgeTable, buildFloodSetup, buildForcing, computeEdgeStates, floodStats, waterLevelFlood, type EdgeTable, type TravelMode } from '../sim/hydrology';
-import { rainSeries, totalRain } from '../sim/rainfall';
-import { buildRiskSetup, hoodRisk, riskPosterior, type RiskSetup } from '../sim/riskModel';
-import { resolveStorm, SCENARIO_IDS, SCENARIOS, scenarioFromURL, scenarioToURL, type ScenarioId, type ScenarioParams } from '../sim/scenario';
-import { createScrubber } from '../ui/controls/scrubber';
+import { pickGaugeCell, type FrameMsg } from '../sim/floodEngine';
+import { buildEdgeTable, buildFloodSetup, buildForcing, type EdgeTable } from '../sim/hydrology';
+import { ALGO_NAMES, Journey, journeyNet, type Algo, type Conditions, type JourneyEvent, type JourneyNet, type PlanResult, type RouteInfo } from '../sim/journey';
+import { DEFAULT_SCENARIO } from '../sim/scenario';
 import { createSegmented } from '../ui/controls/segmented';
 import { createSlider } from '../ui/controls/slider';
-import { createToggle } from '../ui/controls/toggle';
 import { announce, h } from '../ui/dom';
-import { createMapView, type Layers, type Selection } from '../ui/mapView';
+import { createMapView } from '../ui/mapView';
 import { makeSheet } from '../ui/sheet';
 import { DEFAULT_MUMBAI } from '../world/mumbai';
 import type { World } from '../world/types';
 import { loadMumbai } from '../world/worldClient';
 
-type Mode = 'storm' | 'level';
-const SPEEDS = ['0.25', '0.5', '1', '2', '4', '8', '16'] as const;
-type SpeedStr = (typeof SPEEDS)[number];
+/** Trips that meet the flood on 26 July 2005 (checked against the model). */
+const PRESETS: { label: string; from: RegExp; to: RegExp; leave: number; story: string }[] = [
+  { label: 'Kalina to Dadar Vidya Mandir', from: /kalina/i, to: /Dadar Vidya/i, leave: 120, story: 'A bridge closes before the car leaves, then a road floods while it is on the way: two re-plans.' },
+  { label: 'Bandra West to SIES College', from: /bandra west/i, to: /SIES/i, leave: 120, story: 'Mahim Causeway closes before departure; a link road floods on the way.' },
+  { label: 'Kurla East to SNDT College', from: /kurla east/i, to: /SNDT/i, leave: 210, story: 'A late departure: Ghatkopar Mahul Road floods mid-trip.' },
+  { label: 'Kalina, leaving too late', from: /kalina/i, to: /Dadar Vidya/i, leave: 210, story: 'Leaving at t+03:30, every way out is under water: the planner says so honestly.' },
+];
 
-const LEGEND_SVG: Record<string, string> = {
-  arterial: `<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="var(--background)" stroke-width="6" stroke-linecap="round"/><path d="M2 7h38" stroke="color-mix(in oklab, var(--text) 84%, var(--background))" stroke-width="3" stroke-linecap="round"/></svg>`,
-  local: `<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="color-mix(in oklab, var(--text) 55%, var(--background))" stroke-width="1.5" stroke-linecap="round"/></svg>`,
-  degraded: `<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="color-mix(in oklab, var(--accent) 60%, var(--text))" stroke-width="2" stroke-dasharray="3 3"/></svg>`,
-  blocked: `<svg viewBox="0 0 42 14"><defs><pattern id="lg-h" width="5" height="5" patternUnits="userSpaceOnUse"><path d="M0 5L5 0M0 0l5 5" stroke="var(--text)" stroke-opacity=".55" stroke-width=".8"/></pattern></defs><rect x="2" y="2" width="38" height="10" fill="url(#lg-h)"/><path d="M2 7h38" stroke="var(--text)" stroke-width="2" stroke-dasharray="6 5"/></svg>`,
-  bridge: `<svg viewBox="0 0 42 14"><path d="M4 7h34" stroke="var(--text)" stroke-width="7"/><path d="M4 7h34" stroke="var(--background)" stroke-width="4"/><path d="M8 2v10M34 2v10" stroke="var(--text)" stroke-width="1.4"/></svg>`,
-  flyover: `<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="color-mix(in oklab, var(--text) 90%, var(--background))" stroke-width="6"/><path d="M2 7h38" stroke="color-mix(in oklab, var(--background) 75%, var(--secondary))" stroke-width="3.5"/></svg>`,
-  tunnel: `<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="var(--background)" stroke-width="6"/><path d="M2 7h38" stroke="var(--text)" stroke-width="2.5" stroke-dasharray="1.5 3" stroke-linecap="round"/></svg>`,
-  water: `<svg viewBox="0 0 42 14"><defs><linearGradient id="lg-w"><stop offset="0" stop-color="color-mix(in oklab, var(--background) 45%, var(--secondary))"/><stop offset=".5" stop-color="color-mix(in oklab, var(--accent) 65%, var(--primary))"/><stop offset="1" stop-color="color-mix(in oklab, var(--primary) 72%, var(--text))"/></linearGradient></defs><rect x="2" y="3" width="38" height="8" rx="2" fill="url(#lg-w)"/></svg>`,
-  mangrove: `<svg viewBox="0 0 42 14"><defs><pattern id="lg-m" width="5" height="5" patternUnits="userSpaceOnUse"><circle cx="1.5" cy="1.5" r=".8" fill="color-mix(in oklab, var(--primary) 65%, var(--text))"/></pattern></defs><rect x="2" y="2" width="38" height="10" fill="url(#lg-m)" stroke="color-mix(in oklab, var(--primary) 50%, transparent)" stroke-width=".8"/></svg>`,
-  shelter: `<svg viewBox="0 0 42 14"><path d="M15.5 13V7.5a5.5 5.5 0 0 1 11 0V13M12 13h18" fill="none" stroke="var(--text)" stroke-width="1.8" stroke-linecap="round"/></svg>`,
-  gMoving: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.4"/><circle cx="21" cy="7" r="2.4" fill="var(--text)"/></svg>`,
-  gWaiting: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="color-mix(in oklab, var(--text) 65%, var(--background))" stroke-width="1.4"/></svg>`,
-  gStuck: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="6.4" fill="none" stroke="var(--text)" stroke-width="1.2" stroke-dasharray="2 2"/><circle cx="21" cy="7" r="4" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.3"/><circle cx="21" cy="7" r="2" fill="var(--text)"/></svg>`,
-  gStranded: `<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="color-mix(in oklab, var(--primary) 65%, var(--text))" stroke-width="1.4"/><path d="M18.8 4.8l4.4 4.4M23.2 4.8l-4.4 4.4" stroke="var(--text)" stroke-width="1.5"/></svg>`,
-  route: `<svg viewBox="0 0 42 14"><path d="M2 10c10 0 12-6 20-6s12 4 18 4" fill="none" stroke="color-mix(in oklab, var(--primary) 80%, var(--text))" stroke-width="2.4" stroke-linecap="round"/></svg>`,
-  riskLow: riskSwatch(0.15),
-  riskMid: riskSwatch(0.5),
-  riskHigh: riskSwatch(0.9),
-};
+/** How long the search animation takes to reveal, then fade, ms. */
+const REVEAL_MS = 2000;
+const FADE_MS = 4000;
+/** Hold the storm this long on each re-plan so it can be seen, ms. */
+const HOLD_MS = 2600;
 
-/** Legend swatch with the same hatch spacing the map uses for probability p. */
-function riskSwatch(p: number): string {
-  const sp = hatchSpacing(p).toFixed(1);
-  const id = `lg-r${Math.round(p * 100)}`;
-  const edge = p >= 2 / 3 ? `stroke="var(--text)" stroke-opacity=".55" stroke-width="1.4"` : `stroke="var(--text)" stroke-opacity=".28" stroke-dasharray="2 3"`;
-  return `<svg viewBox="0 0 42 14"><defs><pattern id="${id}" width="${sp}" height="${sp}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><path d="M0 0v${sp}" stroke="var(--text)" stroke-opacity="${hatchAlpha(p).toFixed(2)}" stroke-width="1"/></pattern></defs><rect x="2" y="1" width="38" height="12" fill="url(#${id})" ${edge}/></svg>`;
-}
+type Speed = '4' | '8' | '16';
 
 const page: Page = {
   title: 'Simulator',
   mount({ root, params: query, signal }) {
-    // ── State ──
-    let sp: ScenarioParams = scenarioFromURL(query);
-    let mode: Mode = query.get('mode') === 'level' ? 'level' : 'storm';
-    let level = parseClamped(query.get('level'), 2.5, 0, 10);
-    let travel: TravelMode = query.get('travel') === 'foot' ? 'foot' : 'vehicle';
-    let speed: SpeedStr = '1';
-    const strategyParam = query.get('strategy');
-    let strategy: Strategy = strategyParam === 'naive' || strategyParam === 'risk' ? strategyParam : 'dynamic';
-    const agentLayer = new AgentLayer();
-    const riskLayer = new RiskLayer();
-    const net = mumbaiNetwork();
-    let riskSetup: RiskSetup | null = null;
-    let lastRisk: RiskFrame | null = null;
-    /** Per hood P(FloodRisk = low, medium, high), whichever mode produced it. */
-    let hoodDist: Float32Array | null = null;
-    let showRisk = true;
-    let currentSel: Selection = null;
-    let selectedGroup = -1;
-    let frameAt = 0;
-    let frameInterval = 1000;
-    let lastReplans = 0;
-    let announcedDone = false;
-    let showAgents = true;
     let world: World | null = null;
     let table: EdgeTable | null = null;
+    let net: JourneyNet | null = null;
     let client: FloodClient | null = null;
-    let duration = SCENARIOS[sp.scenario].storm.duration;
+    let start = -1, goal = -1;
+    let nextPick: 'start' | 'goal' = 'start';
+    let algo: Algo = (['astar', 'ucs', 'greedy', 'bfs', 'dfs'] as Algo[]).includes(query.get('algo') as Algo) ? (query.get('algo') as Algo) : 'astar';
+    let leaveAt = parseClamped(query.get('leave'), 120, 0, 360);
+    let speed: Speed = '8';
+    let journey: Journey | null = null;
+    let jMinute = 0;
     let minute = 0;
-    let lastMinute = -1;
     let playing = false;
-    let wasPlayingBeforeHide = false;
-    let stage: number[] = [];
-    let lastState: Uint8Array | null = null;
-    let lastFrame: FrameMsg | null = null;
-    let genToken = 0;
-    const events: string[] = [];
-    /** Group specs of the running simulation (neighbourhood of each group). */
-    let groupSpecs: GroupSpec[] = [];
-    /** Assignment events already logged (a rewind replays them; log each once). */
-    const assignSeen = new Set<string>();
-    /** Water-level mode: demand that cannot reach any open centre. */
-    let levelCut: { people: number; hoods: string[] } | null = null;
-    let cutTimer: ReturnType<typeof setTimeout> | null = null;
-    const quality = () => prefs.get().quality;
-    const gridFor = (q: Quality) => (q === 'high' ? 256 : q === 'low' ? 128 : weakDevice() ? 128 : 192);
+    let holding: ReturnType<typeof setTimeout> | null = null;
+    let cond: Conditions | null = null;
+    let anim: { nodes: Int32Array; at: number } | null = null;
+    let goalName = '', startName = '';
+    const logLines: { minute: number; text: string; strong?: boolean }[] = [];
+    const reduce = () => prefs.get().reducedMotion;
 
     // ── Map ──
     const status = h('div', { class: 'map-status', role: 'status' }, 'Loading the Mumbai map');
-    const interp = () => clamp((performance.now() - frameAt) / Math.max(16, frameInterval), 0, 1);
     const map = createMapView({
-      label: 'Flood map of the Mithi River basin, Mumbai',
-      onSelect: (sel) => {
-        selectedGroup = sel?.kind === 'group' ? sel.id : -1;
-        currentSel = sel;
-        showInspector(sel);
-        if (sel) sheet.reveal(inspector);
+      label: 'Map: tap to choose the start, then the destination',
+      hint: 'Tap the map to choose the start, then the destination. Drag to pan, scroll or pinch to zoom.',
+      onTap: (wx, wy) => {
+        pickAt(wx, wy);
+        return true;
       },
-      drawExtra: (d) => {
-        if (showRisk && world) riskLayer.draw(d, world);
-        if (mode === 'storm' && showAgents && world) agentLayer.draw(d, world, interp(), selectedGroup);
-      },
-      hitExtra: (sx, sy) => {
-        if (mode !== 'storm' || !showAgents) return null;
-        const id = agentLayer.hitTest(map.camera, sx, sy, interp());
-        return id >= 0 ? { kind: 'group', id } : null;
-      },
+      drawExtra: (d) => draw(d),
     });
-    const mapWrap = h('div', { class: 'map' }, map.el, status);
+    map.setLayers({ hoods: false, streets: false, contours: false });
+    const clockBig = h('div', { class: 'figure' }, 't+00:00');
+    const clockLine = h('div', { class: 'map-clock-line' }, 'Choose a trip');
+    const clockLine2 = h('div', { class: 'map-clock-line' });
+    const mapClock = h('div', { class: 'map-clock', 'aria-hidden': 'true' }, clockBig, clockLine, clockLine2);
+    const mapWrap = h('div', { class: 'map' }, map.el, mapClock, status);
 
-    // ── Rail: flood control ──
-    const modeCtl = createSegmented<Mode>({
-      label: 'Flood by',
-      value: mode,
-      options: [
-        { value: 'storm', label: 'Storm simulation', hint: 'Physical model: rain, tide, drains and river inflow over time' },
-        { value: 'level', label: 'Water level', hint: 'Instant: drag to raise or lower the water' },
-      ],
-      onChange: (m) => setMode(m),
+    // ── Rail: the trip ──
+    const presetCtl = createSegmented<string>({
+      label: 'A trip that meets the flood',
+      value: '0',
+      options: PRESETS.map((p, i) => ({ value: String(i), label: p.label, hint: p.story })),
+      onChange: (v) => applyPreset(Number(v)),
     });
-
-    const strategyCtl = createSegmented<Strategy>({
-      label: 'Evacuation strategy',
-      value: strategy,
-      options: [
-        { value: 'naive', label: 'Naive static', hint: 'Plan once on the dry map; never re-plan; wait at closed roads' },
-        { value: 'dynamic', label: 'Dynamic A*', hint: 'A* on live road states, re-plans when roads close' },
-        { value: 'risk', label: 'Risk-aware + CSP + SA', hint: 'At the warning a constraint solver assigns every group a centre with room, simulated annealing improves the plan, and groups travel by risk-aware A*; the plan is re-run when a centre is cut off' },
-      ],
-      onChange: (st) => {
-        strategy = st;
-        lastReplans = 0;
-        announcedDone = false;
-        assignSeen.clear();
-        client?.send({ type: 'strategy', strategy: st });
-        log(`Strategy changed to ${strategyWord(st)}; the run was recomputed from the start.`);
-        syncURL();
+    const tripLine = h('p', { class: 'trip-line', 'aria-live': 'polite' });
+    const pickStartBtn = h('button', { class: 'btn', type: 'button' }, 'Choose the start on the map');
+    const pickGoalBtn = h('button', { class: 'btn', type: 'button' }, 'Choose the destination');
+    pickStartBtn.addEventListener('click', () => setNextPick('start'));
+    pickGoalBtn.addEventListener('click', () => setNextPick('goal'));
+    const pickNote = h('p', { class: 'small muted' });
+    const algoCtl = createSegmented<Algo>({
+      label: 'Search algorithm',
+      value: algo,
+      options: (Object.keys(ALGO_NAMES) as Algo[]).map((a) => ({ value: a, label: ALGO_NAMES[a] })),
+      onChange: (a) => {
+        algo = a;
+        resetTrip('The search algorithm changed');
       },
     });
-
-    const stormCtl = createSegmented<ScenarioId>({
-      label: 'Storm',
-      value: sp.scenario,
-      options: SCENARIO_IDS.map((id) => ({ value: id, label: SCENARIOS[id].label, hint: SCENARIOS[id].blurb })),
-      onChange: (id) => {
-        sp = { ...sp, scenario: id };
-        restartSim();
-      },
-    });
-    const stormBlurb = h('p', { class: 'small muted', style: 'margin: var(--s-2) 0 var(--s-3)' });
-    const stormTotals = h('p', { class: 'small mono', style: 'margin: 0 0 var(--s-3)' });
-
-    const seedInput = h('input', { type: 'text', id: 'seed-input', value: sp.seed, spellcheck: 'false', autocomplete: 'off', maxlength: 32, 'aria-label': 'Seed' });
-    const applySeed = () => {
-      const s = sanitizeSeed(seedInput.value, 'mumbai');
-      seedInput.value = s;
-      if (s === sp.seed) return;
-      sp = { ...sp, seed: s };
-      restartSim();
-    };
-    seedInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') applySeed();
-    });
-    seedInput.addEventListener('change', applySeed);
-    const randomBtn = h('button', { class: 'btn', type: 'button' }, 'Random seed');
-    randomBtn.addEventListener('click', () => {
-      seedInput.value = randomSeedString();
-      applySeed();
-    });
-    const exactBtn = h('button', { class: 'btn', type: 'button' }, 'Historic (exact)');
-    exactBtn.addEventListener('click', () => {
-      seedInput.value = 'mumbai';
-      applySeed();
-    });
-
-    const rainSlider = createSlider({
-      label: 'Rain intensity (live)',
-      min: 0, max: 2, step: 0.05, value: sp.rainScale, ticks: 5,
-      format: (v) => `${Math.round(v * 100)}% of storm`,
+    const leaveSlider = createSlider({
+      label: 'The car leaves at',
+      min: 0, max: 360, step: 10, value: leaveAt, ticks: 7,
+      format: (v) => `${fmtClock(v)} (${v === 0 ? 'at once' : `${fmtMinutes(v)} into the storm`})`,
       onChange: (v) => {
-        sp = { ...sp, rainScale: v };
-        client?.send({ type: 'rain', scale: v });
-        log(`Rain set to ${Math.round(v * 100)}% of the storm from ${fmtClock(minute)}.`);
-        syncURL();
-      },
-    });
-    const tideSlider = createSlider({
-      label: 'Storm surge / sea-level rise',
-      min: -1, max: 2, step: 0.1, value: sp.tideOffset,
-      format: (v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)} m`,
-      onChange: (v) => {
-        sp = { ...sp, tideOffset: v };
-        client?.send({ type: 'forcing', tideOffset: sp.tideOffset, drainScale: sp.drainScale });
-        syncURL();
-      },
-    });
-    const drainSlider = createSlider({
-      label: 'Storm-drain capacity',
-      min: 0, max: 2, step: 0.1, value: sp.drainScale,
-      format: (v) => (v === 0 ? 'blocked' : `${Math.round(v * 25)} mm/h`),
-      onChange: (v) => {
-        sp = { ...sp, drainScale: v };
-        client?.send({ type: 'forcing', tideOffset: sp.tideOffset, drainScale: sp.drainScale });
-        syncURL();
+        leaveAt = v;
+        resetTrip(`The car now leaves at ${fmtClock(v)}`);
       },
     });
 
-    // Playback
-    const playBtn = h('button', { class: 'btn btn-primary', type: 'button', 'aria-pressed': 'false' }, 'Play');
-    const stepBtn = h('button', { class: 'btn', type: 'button' }, 'Step 10 min');
-    const restartBtn = h('button', { class: 'btn', type: 'button' }, 'Restart');
-    playBtn.addEventListener('click', () => togglePlay());
-    stepBtn.addEventListener('click', () => client?.send({ type: 'step', minutes: 10 }));
-    restartBtn.addEventListener('click', () => {
-      client?.send({ type: 'pause' });
-      client?.send({ type: 'seek', minute: 0 });
-    });
-    const speedCtl = createSegmented<SpeedStr>({
+    // ── Rail: the storm ──
+    const runBtn = h('button', { class: 'btn btn-primary btn-large', type: 'button' }, 'Start the storm');
+    const resetBtn = h('button', { class: 'btn', type: 'button' }, 'Back to t+00:00');
+    runBtn.addEventListener('click', () => run());
+    resetBtn.addEventListener('click', () => resetTrip(null));
+    const speedCtl = createSegmented<Speed>({
       label: 'Speed (simulated minutes per second)',
       value: speed,
-      options: SPEEDS.map((s) => ({ value: s, label: `${s}x` })),
+      options: [
+        { value: '4', label: '4x' },
+        { value: '8', label: '8x' },
+        { value: '16', label: '16x' },
+      ],
       onChange: (s) => {
         speed = s;
-        client?.send({ type: 'speed', speed: Number(s) });
-      },
-    });
-    const scrubber = createScrubber({
-      label: 'Timeline',
-      duration,
-      onScrub: (t, final) => {
-        if (final) client?.send({ type: 'seek', minute: t });
-      },
-    });
-    const lagNote = h('p', { class: 'small muted', style: 'margin: var(--s-2) 0 0', 'aria-live': 'polite' });
-
-    const levelSlider = createSlider({
-      label: 'Water level above mean sea level',
-      min: 0, max: 10, step: 0.1, value: level, ticks: 11,
-      format: (v) => `${v.toFixed(1)} m`,
-      onInput: (v) => {
-        level = v;
-        applyLevel();
-      },
-      onChange: () => syncURL(),
-    });
-    const levelNote = h('p', { class: 'small muted' }, 'Water spreads instantly from the sea, Mahim Creek, the Mithi River and the nallahs to all connected ground below this level. Low spots shut in by higher ground stay dry. For scale: a spring high tide reaches about 2 m; 26 July 2005 put parts of Kurla and Kalina under 2 to 3 m of water.');
-
-    const travelCtl = createSegmented<TravelMode>({
-      label: 'Evacuating',
-      value: travel,
-      options: [
-        { value: 'vehicle', label: 'By vehicle', hint: 'Roads close at 30 cm of water' },
-        { value: 'foot', label: 'On foot', hint: 'Roads close at 50 cm of water' },
-      ],
-      onChange: (m) => {
-        travel = m;
-        client?.send({ type: 'mode', mode: m });
-        if (mode === 'level') applyLevel();
-        syncURL();
+        if (playing) client?.send({ type: 'speed', speed: Number(s) });
       },
     });
 
-    const stormGroup = h(
-      'div',
-      null,
-      strategyCtl.el,
-      stormCtl.el,
-      stormBlurb,
-      stormTotals,
-      h('div', { class: 'ctl' }, h('div', { class: 'ctl-row' }, h('label', { class: 'ctl-label', for: 'seed-input' }, 'Seed (varies the storm)')), h('div', { class: 'field' }, seedInput)),
-      h('div', { class: 'cluster', style: 'margin: var(--s-2) 0 var(--s-3)' }, randomBtn, exactBtn),
-      rainSlider.el,
-      tideSlider.el,
-      drainSlider.el,
-      h('div', { class: 'cluster', style: 'margin-top: var(--s-4)' }, playBtn, stepBtn, restartBtn),
-      speedCtl.el,
-      h('div', { style: 'margin-top: var(--s-6)' }, scrubber.el),
-      h('p', { class: 'small muted', style: 'margin: var(--s-2) 0 0' }, 'Shaded: rainfall. Line: Mithi River level at the gauge. Drag the timeline back and forth; the thick base bar shows how far has been computed.'),
-      lagNote,
-    );
-    const levelGroup = h('div', null, levelSlider.el, levelNote);
+    // ── Rail: results ──
+    const routesList = h('ul', { class: 'route-list' });
+    const searchNote = h('div', { class: 'search-note' });
+    const logList = h('ol', { class: 'notes journey-log', 'aria-live': 'polite' });
 
-    const control = h('section', { class: 'rail-section' }, h('h2', null, 'Flood'), modeCtl.el, h('div', { style: 'margin-top: var(--s-3)' }, stormGroup, levelGroup), travelCtl.el);
-
-    // ── Rail: live figures ──
-    const figClock = h('div', { class: 'figure' }, 't+00:00');
-    const figClockLabel = h('div', { class: 'figure-label' }, 'simulated time');
-    const figRain = h('div', { class: 'figure' }, '0');
-    const figFlood = h('div', { class: 'figure' }, '0.0');
-    const figRoads = h('div', { class: 'figure' }, '0');
-    const liveFacts = h('dl', { class: 'facts' });
-    const live = h(
-      'section',
-      { class: 'rail-section' },
-      h('h2', null, 'Now'),
+    const rail = h(
+      'aside',
+      { class: 'rail', 'aria-label': 'Simulator controls and explanation' },
       h(
-        'div',
-        { class: 'big-figures' },
-        h('div', null, figClock, figClockLabel),
-        h('div', null, figRain, h('div', { class: 'figure-label' }, 'rain, mm/h')),
-        h('div', null, figFlood, h('div', { class: 'figure-label' }, 'km² under 10 cm+')),
-        h('div', null, figRoads, h('div', { class: 'figure-label' }, 'road segments closed')),
+        'section',
+        { class: 'rail-section' },
+        h('h2', null, 'Plan a route'),
+        presetCtl.el,
+        tripLine,
+        h('div', { class: 'cluster', style: 'margin: var(--s-2) 0' }, pickStartBtn, pickGoalBtn),
+        pickNote,
+        h('div', { class: 'run-block' }, runBtn, h('div', { class: 'cluster', style: 'margin-top: var(--s-2)' }, resetBtn)),
       ),
-      liveFacts,
-    );
-
-    const evSheltered = h('div', { class: 'figure' }, '0');
-    const evStranded = h('div', { class: 'figure' }, '0');
-    const evFacts = h('dl', { class: 'facts' });
-    const evacSec = h(
-      'section',
-      { class: 'rail-section' },
-      h('h2', null, 'Evacuation'),
-      h('div', { class: 'big-figures' }, h('div', null, evSheltered, h('div', { class: 'figure-label' }, 'people in relief centres')), h('div', null, evStranded, h('div', { class: 'figure-label' }, 'stuck or stranded'))),
-      evFacts,
-    );
-
-    const eventsList = h('ol', { class: 'notes', reversed: true });
-    const eventsSec = h('section', { class: 'rail-section' }, h('h2', null, 'Events'), eventsList);
-
-    const inspectorBody = h('div', null, h('p', { class: 'small muted' }, 'Tap a neighbourhood, road, bridge, subway or relief centre on the map.'));
-    const inspector = h('section', { class: 'rail-section', 'aria-live': 'polite' }, h('h2', null, 'Inspector'), inspectorBody);
-
-    const cityFigures = h('div', { class: 'big-figures' });
-    const cityFacts = h('dl', { class: 'facts' });
-    const city = h('section', { class: 'rail-section' }, h('h2', null, 'Mithi River basin'), cityFigures, cityFacts);
-
-    const layerDefs: [keyof Layers, string][] = [
-      ['water', 'Water'],
-      ['terrain', 'Relief'],
-      ['contours', 'Contours (2 m)'],
-      ['streets', 'Residential streets'],
-      ['roads', 'Main roads'],
-      ['hoods', 'Neighbourhoods'],
-      ['shelters', 'Relief centres'],
-      ['labels', 'Labels'],
-    ];
-    const qualityCtl = createSegmented<Quality>({
-      label: 'Quality',
-      value: quality(),
-      options: [
-        { value: 'auto', label: 'Auto', hint: '192 x 192 grid (128 on slower devices), adaptive resolution' },
-        { value: 'high', label: 'High', hint: '256 x 256 grid, about 39 m cells' },
-        { value: 'low', label: 'Low', hint: '128 x 128 grid, about 78 m cells' },
-      ],
-      onChange: (q) => {
-        setQuality(q);
-        map.setQuality(q);
-        reloadWorld();
-      },
-    });
-    const agentToggles = [
-      createToggle({ label: 'Flood risk hatching (Bayes)', value: true, onChange: (v) => { showRisk = v; map.requestRender(); } }).el,
-      createToggle({ label: 'Evacuee groups', value: true, onChange: (v) => { showAgents = v; map.requestRender(); } }).el,
-      createToggle({ label: 'Planned routes', value: true, onChange: (v) => { agentLayer.showRoutes = v; map.requestRender(); } }).el,
-    ];
-    const layers = h('section', { class: 'rail-section' }, h('h2', null, 'Layers'), ...agentToggles, ...layerDefs.map(([k, label]) => createToggle({ label, value: true, onChange: (v) => map.setLayers({ [k]: v }) }).el), h('div', { style: 'margin-top: var(--s-3)' }, qualityCtl.el));
-
-    const legend = h(
-      'section',
-      { class: 'rail-section' },
-      h('h2', null, 'Legend'),
+      h('section', { class: 'rail-section' }, h('h2', null, 'Routes now'), routesList, h('ul', { class: 'legend route-legend' }, ...legendItems())),
       h(
-        'ul',
-        { class: 'legend' },
-        ...([
-          ['water', 'Water, shallow to deep'],
-          ['arterial', 'Main road (open)'],
-          ['local', 'Other road (open)'],
-          ['degraded', 'Flooded, passable slowly'],
-          ['blocked', 'Closed by water'],
-          ['bridge', 'Bridge over water'],
-          ['flyover', 'Flyover (stays dry)'],
-          ['tunnel', 'Subway or underpass (floods first)'],
-          ['mangrove', 'Mangroves and wetland'],
-          ['shelter', 'Relief centre (arc: how full)'],
-          ['gMoving', 'Evacuee group on the move'],
-          ['gWaiting', 'Group waiting to leave'],
-          ['gStuck', 'Group stuck at a closed road'],
-          ['gStranded', 'Group with no reachable centre'],
-          ['route', 'Planned route'],
-          ['riskLow', 'Flood risk: P(high) about 15%'],
-          ['riskMid', 'Flood risk: about 50%'],
-          ['riskHigh', 'Flood risk: about 90% (heavy edge above 2 in 3)'],
-        ] as [string, string][]).map(([k, label]) => h('li', null, h('span', { html: LEGEND_SVG[k], 'aria-hidden': 'true' }), label)),
+        'section',
+        { class: 'rail-section' },
+        h('h2', null, 'Settings'),
+        algoCtl.el,
+        leaveSlider.el,
+        speedCtl.el,
       ),
+      h('section', { class: 'rail-section' }, h('h2', null, 'How the route was found'), searchNote),
+      h('section', { class: 'rail-section' }, h('h2', null, 'Journey'), logList),
     );
-
-    const notesList = h('ul', { class: 'notes' });
-    const notes = h('section', { class: 'rail-section' }, h('h2', null, 'About this map'), notesList);
-
-    const rail = h('aside', { class: 'rail', 'aria-label': 'Flood controls and map information' }, control, live, evacSec, eventsSec, inspector, city, layers, legend, notes);
-    root.append(h('h1', { class: 'visually-hidden' }, 'Simulator: a storm over the Mithi River basin, Mumbai'), h('div', { class: 'map-layout' }, mapWrap, rail));
+    root.append(h('h1', { class: 'visually-hidden' }, 'Simulator: one trip through the flood'), h('div', { class: 'map-layout' }, mapWrap, rail));
     const sheet = makeSheet(rail, 'Controls');
 
-    // ── Helpers ──
-    function syncURL() {
-      replaceParams({ ...scenarioToURL(sp), ...(strategy !== 'dynamic' ? { strategy } : {}), ...(mode === 'level' ? { mode: 'level', level: level.toFixed(1) } : {}), ...(travel === 'foot' ? { travel } : {}) });
-    }
-
-    function log(sentence: string) {
-      events.unshift(sentence);
-      if (events.length > 60) events.length = 60;
-      eventsList.replaceChildren(...events.map((e) => h('li', null, e)));
-    }
-
-    function setMode(m: Mode) {
-      mode = m;
-      levelCut = null;
-      stormGroup.hidden = m !== 'storm';
-      levelGroup.hidden = m !== 'level';
-      if (m === 'level') {
-        client?.send({ type: 'pause' });
-        applyLevel();
-      } else if (lastFrame) {
-        // Back to the simulation: show its current state again.
-        lastRisk = null;
-        setHoodDist(lastFrame.risk?.hood ?? null);
-        client?.send({ type: 'seek', minute });
-      }
-      syncURL();
-    }
-
-    function renderCity(w: World) {
-      cityFigures.replaceChildren(
-        h('div', null, h('div', { class: 'figure' }, fmtInt(w.totalPopulation)), h('div', { class: 'figure-label' }, 'people in low-lying homes likely to need shelter')),
-        h('div', null, h('div', { class: 'figure' }, fmtInt(w.totalCapacity)), h('div', { class: 'figure-label' }, `places in ${w.shelters.length} relief centres`)),
-      );
-      const kinds = { bridge: 0, flyover: 0, tunnel: 0 };
-      for (const e of w.graph.edges) if (e.kind in kinds) kinds[e.kind as keyof typeof kinds]++;
-      cityFacts.replaceChildren(
-        ...[
-          ['Residents (estimate)', fmtInt(w.residents)],
-          ['Area', `${fmtNum((w.terrain.size / 1000) ** 2, 0)} km²`],
-          ['Neighbourhoods', String(w.hoods.length)],
-          ['Road junctions', fmtInt(w.graph.nodes.length)],
-          ['Road segments', fmtInt(w.graph.edges.length)],
-          ['Bridges / flyovers / subways', `${kinds.bridge} / ${kinds.flyover} / ${kinds.tunnel}`],
-          ['Evacuee groups', `${fmtInt(Math.ceil(w.totalPopulation / w.groupSize))} of ${fmtInt(w.groupSize)}`],
-          ['Grid', `${w.terrain.n} x ${w.terrain.n}, ${fmtNum(w.terrain.cell, 0)} m cells`],
-          ['Renderer', map.renderer() === 'webgl' ? 'WebGL2' : 'Canvas 2D (fallback)'],
-        ].flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)]),
-      );
-      notesList.replaceChildren(
-        ...[
-          'Roads, rivers, nallahs, mangroves, neighbourhood names and relief centres come from OpenStreetMap. Elevation is NASA SRTM, smoothed to remove building roofs.',
-          'Residents are estimated from typical densities for each suburb, not counted. Demand is the share of residents in homes below 6 m above sea level who would seek a relief centre.',
-          ...w.notes,
-          w.attribution,
-        ].map((n) => h('li', null, n)),
-      );
-    }
-
-    function renderStormInfo() {
-      const s = resolveStorm(sp);
-      stormBlurb.textContent = SCENARIOS[sp.scenario].blurb;
-      stormTotals.textContent = `about ${Math.round(totalRain(s))} mm over ${Math.round(s.duration / 60)} h, peak ${Math.round(s.peak)} mm/h at ${fmtClock(s.peakAt)}, high tide ${fmtClock(((s.highTideAt % 745) + 745) % 745)}`;
-    }
-
-    function updateFigures(stats: { rain: number; floodedKm2: number; blocked: number; degraded: number; maxDepth: number; tide?: number; gaugeStage?: number; drainEff?: number; inflow?: number; massError?: number }) {
-      figClock.textContent = mode === 'storm' ? fmtClock(minute) : `${level.toFixed(1)} m`;
-      figClockLabel.textContent = mode === 'storm' ? 'simulated time' : 'water level above sea';
-      figRain.textContent = fmtInt(stats.rain);
-      figFlood.textContent = fmtNum(stats.floodedKm2, 1);
-      figRoads.textContent = fmtInt(stats.blocked);
-      const rows: [string, string][] = [['Roads slowed by water', fmtInt(stats.degraded)], ['Deepest water on land', `${fmtNum(stats.maxDepth, 2)} m`]];
-      if (mode === 'storm' && stats.tide !== undefined) {
-        rows.push(
-          ['Sea level (tide + surge)', `${stats.tide >= 0 ? '+' : ''}${fmtNum(stats.tide, 2)} m`],
-          ['Mithi River at the gauge', `${fmtNum(stats.gaugeStage ?? 0, 2)} m`],
-          ['Upstream inflow', `${fmtInt(stats.inflow ?? 0)} m³/s`],
-          ['Drains working at', `${Math.round((stats.drainEff ?? 1) * 100)}%`],
-          ['Water balance error', (stats.massError ?? 0).toExponential(1)],
-        );
-      }
-      const r = mode === 'storm' ? lastRisk : null;
-      if (r) {
-        const rd = r.readings;
-        rows.push(
-          ['Rain gauge reads', `${RAIN_STATES[rd.rain]}${rd.rain !== rd.rainTrue ? ' (misread)' : ''}`],
-          ['River gauge reads', `${RIVER_STATES[rd.river]}${rd.river !== rd.riverTrue ? ' (misread)' : ''}`],
-          ['P(heavy rain | gauges)', fmtNum(r.pRain[2], 2)],
-          ['P(river high | gauges)', fmtNum(r.pRiver[2], 2)],
-        );
-      }
-      if (hoodDist && world) {
-        let worst = 0, worstP = -1, over = 0;
-        for (let i = 0; i < world.hoods.length; i++) {
-          const ph = hoodDist[i * 3 + 2];
-          if (ph >= 0.5) over += world.hoods[i].population;
-          if (world.hoods[i].population > 0 && ph > worstP) {
-            worstP = ph;
-            worst = i;
-          }
+    // ── Choosing the trip ──
+    function nearestNode(x: number, y: number): number {
+      const w = world;
+      if (!w) return -1;
+      let best = -1, bestD = Infinity;
+      for (const nd of w.graph.nodes) {
+        if (w.graph.adjStart[nd.id + 1] === w.graph.adjStart[nd.id]) continue;
+        const d = (nd.x - x) ** 2 + (nd.y - y) ** 2;
+        if (d < bestD) {
+          bestD = d;
+          best = nd.id;
         }
-        rows.push(['Highest flood risk', `${world.hoods[worst].name}, ${fmtNum(worstP, 2)}`], ['Demand in areas at 50%+ risk', fmtInt(over)]);
       }
-      if (mode === 'level' && levelCut) rows.push(['Cut off from every centre', levelCut.people ? `${fmtInt(levelCut.people)} people${levelCut.hoods.length ? ` (${listOf(levelCut.hoods)})` : ''}` : 'nobody']);
-      liveFacts.replaceChildren(...rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)]));
-      map.setSummary(`${mode === 'storm' ? `At ${fmtClock(minute)}` : `Water at ${level.toFixed(1)} m`}: ${fmtNum(stats.floodedKm2, 1)} square kilometres flooded, ${stats.blocked} road segments closed, rain ${Math.round(stats.rain)} mm per hour.`);
+      return best;
     }
 
-    /** Plain-sentence events for bridges, subways and big changes. Grouped by street name. */
-    const floodedSubways = new Set<string>();
-    function trackEvents(state: Uint8Array, when: string) {
+    function placeName(v: number): string {
+      const w = world!;
+      const s = w.shelters.find((sh) => sh.node === v);
+      if (s) return s.name.replace(/^S\d+\s+/, '');
+      const hd = w.graph.nodes[v].hood;
+      return hd >= 0 ? `a junction in ${w.hoods[hd].name}` : `junction J${v}`;
+    }
+
+    function pickAt(wx: number, wy: number) {
       const w = world;
       if (!w) return;
-      if (lastState && lastState.length === state.length) {
-        const closedB = new Map<string, string[]>(), openedB = new Map<string, string[]>();
-        const subways: string[] = [];
-        let arterials = 0;
-        for (let i = 0; i < state.length; i++) {
-          if (state[i] === lastState[i]) continue;
-          const e = w.graph.edges[i];
-          const street = e.street || 'unnamed road';
-          if (e.kind === 'bridge') {
-            const target = state[i] === 2 ? closedB : lastState[i] === 2 ? openedB : null;
-            if (target) target.set(street, [...(target.get(street) ?? []), e.name]);
-          } else if (e.kind === 'tunnel') {
-            const key = e.street || `underpass ${e.name}`;
-            if (state[i] === 2 && !floodedSubways.has(key)) {
-              floodedSubways.add(key);
-              subways.push(e.street ? `${e.street}` : `An unnamed underpass (${e.name})`);
-            } else if (state[i] === 0) floodedSubways.delete(key);
-          } else if (e.cls === 'arterial' && state[i] === 2 && lastState[i] !== 2) arterials++;
+      let v = nearestNode(wx, wy);
+      if (v < 0) return;
+      if (nextPick === 'goal') {
+        // Snap to a relief centre if one is close: that is usually what you mean.
+        for (const s of w.shelters) {
+          const nd = w.graph.nodes[s.node];
+          if (Math.hypot(nd.x - wx, nd.y - wy) < 450) v = s.node;
         }
-        const bridgeText = (m: Map<string, string[]>) => listOf([...m].map(([st, codes]) => `${st} (${codes.join(', ')})`));
-        if (closedB.size) log(`Bridge${closedB.size > 1 ? 's' : ''} closed at ${when}: ${bridgeText(closedB)}. The water rose above the deck.`);
-        if (openedB.size) log(`Bridge${openedB.size > 1 ? 's' : ''} reopened at ${when}: ${bridgeText(openedB)}.`);
-        if (subways.length) log(`${listOf(subways)} flooded at ${when}: subways and underpasses fill first.`);
-        if (arterials >= 5) log(`${arterials} main-road segments went under at ${when}.`);
+        goal = v;
+        nextPick = 'start';
+      } else {
+        start = v;
+        nextPick = 'goal';
       }
-      lastState = state.slice();
+      presetCtl.set('' as string, true);
+      resetTrip(null);
     }
 
-    function updateEvacuation(m: AgentMetrics, at: number, jump: boolean, p: Float32Array | null) {
-      const total = m.sheltered + m.enRoute + m.waiting + m.stranded + m.noAccess;
-      let stuck = 0;
-      if (p) for (let o = 0; o < p.length; o += STRIDE) if (p[o + 2] === Status.Stuck) stuck += p[o + 3];
-      evSheltered.textContent = fmtInt(m.sheltered);
-      evStranded.textContent = fmtInt(stuck + m.stranded + m.noAccess);
-      evFacts.replaceChildren(
-        ...([
-          ['Strategy', strategyWord(strategy)],
-          ['Sheltered', `${fmtInt(m.sheltered)} of ${fmtInt(total)} (${total ? Math.round((m.sheltered / total) * 100) : 0}%)`],
-          ['On the move', fmtInt(m.enRoute - stuck)],
-          ['Waiting at a closed road', fmtInt(stuck)],
-          ['Not left yet', fmtInt(m.waiting)],
-          ['No reachable centre', fmtInt(m.stranded + m.noAccess)],
-          ['Mean trip (sheltered)', m.sheltered ? fmtMinutes(m.meanMinutes) : 'n/a'],
-          ['95th percentile trip', m.sheltered ? fmtMinutes(m.p95Minutes) : 'n/a'],
-          ['Re-plans so far', fmtInt(m.replans)],
-          ...(strategy === 'risk' ? ([['CSP + SA plans made', fmtInt(m.assignRuns)], ['Groups moved by re-assignment', fmtInt(m.reassigned)]] as [string, string][]) : []),
-        ] as [string, string][]).flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)]),
-      );
-      if (!jump && m.replans - lastReplans >= 3) log(`${m.replans - lastReplans} groups re-planned around closed roads at ${fmtClock(at)}.`);
-      lastReplans = m.replans;
-      if (!jump && !announcedDone && m.waiting === 0 && m.enRoute === 0 && m.sheltered > 0) {
-        announcedDone = true;
-        log(`Evacuation finished at ${fmtClock(at)}: ${fmtInt(m.sheltered)} people sheltered, ${fmtInt(m.stranded + m.noAccess)} could not reach a centre.`);
-      }
+    function setNextPick(p: 'start' | 'goal') {
+      nextPick = p;
+      updatePickNote();
     }
 
-    function onFrame(f: FrameMsg) {
-      if (signal.aborted || mode !== 'storm') {
-        requestAnimationFrame(() => client?.send({ type: 'ack' }));
-        return;
-      }
-      const prev = lastFrame;
-      lastFrame = f;
-      const jump = Math.abs(f.minute - lastMinute) !== 1;
-      minute = f.minute;
-      frameAt = performance.now();
-      frameInterval = f.playing ? 1000 / Number(speed) : 0;
-      map.setDepth(f.depth, f.flow, { reset: jump, intervalMs: frameInterval });
-      agentLayer.setPositions(f.agents, !jump, world?.shelters.length ?? 0);
-      if (f.metrics) updateEvacuation(f.metrics, f.minute, jump, f.agents);
-      for (const a of f.assign) logAssign(a);
-      if (currentSel && (currentSel.kind === 'group' || currentSel.kind === 'shelter') && f.minute !== lastMinute) showInspector(currentSel, false);
-      map.setEdgeState(f.edgeState);
-      map.setRain(clamp(f.stats.rain / 120, 0, 1));
-      applyRiskFrame(f.risk, jump, prev?.risk ?? null);
-      scrubber.set(f.minute);
-      scrubber.setBuffered(f.computed / duration);
-      updateFigures(f.stats);
-      if (!jump) trackEvents(f.edgeState, fmtClock(f.minute));
-      else lastState = f.edgeState.slice();
-      // Tide and rain milestones.
-      const s = resolveStorm(sp);
-      if (!jump && lastMinute < Math.round(s.peakAt) && f.minute >= Math.round(s.peakAt)) log(`Rain peaked at about ${Math.round(f.stats.rain)} mm/h at ${fmtClock(f.minute)}.`);
-      if (!jump && f.stats.drainEff < 0.35 && (prev?.stats.drainEff ?? 1) >= 0.35) log(`High tide at ${fmtClock(f.minute)}: outfall gates are shut and drains are barely emptying.`);
-      lastMinute = f.minute;
-      setPlaying(f.playing);
-      lagNote.textContent = f.lagging ? 'This device cannot keep up with this speed; the simulation is running as fast as it can.' : '';
-      status.hidden = true;
-      requestAnimationFrame(() => client?.send({ type: 'ack' }));
+    function updatePickNote() {
+      pickNote.textContent = nextPick === 'start' ? 'Next tap on the map sets the START.' : 'Next tap on the map sets the DESTINATION (tap near a relief centre to choose it).';
+      pickStartBtn.setAttribute('aria-pressed', String(nextPick === 'start'));
+      pickGoalBtn.setAttribute('aria-pressed', String(nextPick === 'goal'));
     }
 
-    /** A CSP + SA assignment from the engine, in plain words (each logged once). */
-    function logAssign(a: AssignEvent) {
-      const key = `${a.minute}:${a.kind}`;
-      if (assignSeen.has(key) || !world) return;
-      assignSeen.add(key);
+    function applyPreset(i: number) {
       const w = world;
-      const when = fmtClock(a.minute);
-      const gain = a.energyCSP > 0 ? Math.round(((a.energyCSP - a.energySA) / a.energyCSP) * 100) : 0;
-      const sa = gain > 0 ? ` Simulated annealing then cut the plan's cost (travel time, flood exposure, crowding) by ${gain}%.` : '';
-      const short = a.status === 'relaxed' ? ` No plan could place everyone (${a.why}); the relaxed plan places ${fmtInt(a.placed)} of ${fmtInt(a.people)} people.` : '';
-      if (a.kind === 'initial') {
-        log(`Evacuation warning at ${when}. ${a.status === 'solved' ? `The constraint solver gave all ${a.groups} groups (${fmtInt(a.people)} people) a relief centre with room, in ${fmtInt(a.nodes)} search nodes.` : 'The constraint solver could not give every group a centre.'}${short}${sa}`);
-        return;
-      }
-      // A check that changed nothing is not news.
-      if (!a.moved && !a.lostCentres.length) return;
-      const centres = a.lostCentres.map((i) => w.shelters[i]?.name ?? `S${i + 1}`);
-      const trigger = centres.length ? `${listOf(centres)} can no longer be reached by some groups` : 'roads reopened for groups that had no centre';
-      log(`Re-assignment at ${when}: ${trigger}. ${a.moved ? `${a.moved} group${a.moved > 1 ? 's' : ''} (${fmtInt(a.movedPeople)} people) were given ${centres.length ? 'another' : 'a'} centre` : 'No group had to change centre'}; the rest kept their places.${short}`);
+      if (!w) return;
+      const p = PRESETS[i];
+      const hd = w.hoods.find((x) => p.from.test(x.name));
+      const sh = w.shelters.find((x) => p.to.test(x.name));
+      if (!hd || !sh || hd.accessNode < 0) return;
+      start = hd.accessNode;
+      goal = sh.node;
+      leaveAt = p.leave;
+      leaveSlider.set(leaveAt, true);
+      nextPick = 'start';
+      resetTrip(null);
+      log(0, p.story);
     }
 
-    function setHoodDist(dist: Float32Array | null) {
-      hoodDist = dist;
-      if (!dist) {
-        riskLayer.setRisk(null);
-        return;
-      }
-      const ph = new Float32Array(dist.length / 3);
-      for (let i = 0; i < ph.length; i++) ph[i] = dist[i * 3 + 2];
-      riskLayer.setRisk(ph);
-      map.requestRender();
-    }
-
-    /** New Bayesian posterior from the engine: overlay, events, live inspector. */
-    function applyRiskFrame(r: RiskFrame | null, jump: boolean, prev: RiskFrame | null) {
-      lastRisk = r;
-      if (!r) return;
-      const fresh = !prev || jump || prev.readings.minute !== r.readings.minute;
-      if (!fresh) return;
-      const before = hoodDist;
-      setHoodDist(r.hood);
-      const w = world;
-      if (w && !jump && prev) {
-        const rd = r.readings, when = fmtClock(rd.minute);
-        if (rd.rain !== rd.rainTrue) log(`Rain gauge misread at ${when}: it reported ${RAIN_STATES[rd.rain]} rain, the truth was ${RAIN_STATES[rd.rainTrue]}. The network weighs it against the river gauge.`);
-        if (rd.river !== rd.riverTrue) log(`River gauge misread at ${when}: it reported ${RIVER_STATES[rd.river]}, the river was ${RIVER_STATES[rd.riverTrue]}.`);
-        if (before) {
-          const up: string[] = [], down: string[] = [];
-          for (let i = 0; i < w.hoods.length; i++) {
-            const a = before[i * 3 + 2], b = r.hood[i * 3 + 2];
-            if (a < 0.5 && b >= 0.5) up.push(w.hoods[i].name);
-            else if (a >= 0.5 && b < 0.5) down.push(w.hoods[i].name);
-          }
-          if (up.length) log(`Flood risk rose above 50% at ${when} in ${listOf(up)}.`);
-          if (down.length) log(`Flood risk fell below 50% at ${when} in ${listOf(down)}.`);
-        }
-      }
-      if (currentSel && (currentSel.kind === 'hood' || currentSel.kind === 'edge')) showInspector(currentSel, false);
-    }
-
-    function setPlaying(p: boolean) {
-      if (p === playing) return;
-      playing = p;
-      playBtn.textContent = p ? 'Pause' : 'Play';
-      playBtn.setAttribute('aria-pressed', String(p));
-      map.setAnimating(p);
-    }
-
-    function togglePlay() {
-      if (mode !== 'storm') setMode('storm');
-      if (playing) client?.send({ type: 'pause' });
-      else {
-        if (minute >= duration) client?.send({ type: 'seek', minute: 0 });
-        client?.send({ type: 'play', speed: Number(speed) });
-      }
-    }
-
-    function applyLevel() {
+    // ── The storm ──
+    function startClient() {
       const w = world;
       if (!w || !table) return;
-      const depth = waterLevelFlood(w, level);
-      const st = new Uint8Array(table.count), dep = new Float32Array(table.count);
-      const es = computeEdgeStates(table, depth, w.terrain.height, w.ground, travel, st, dep);
-      map.setDepth(depth, new Float32Array(depth.length * 2), { reset: true, intervalMs: 0 });
-      map.setEdgeState(st);
-      map.setRain(0);
-      // The network in "what if" mode: no rain reading, and the river gauge
-      // reads the standing water level (no sensor noise).
-      if (riskSetup) {
-        const rs = riskSetup;
-        const river = riverClass(Math.max(level, rs.gaugeBed + 0.6), rs.gaugeBed, rs.gaugeBank);
-        setHoodDist(hoodRisk(rs, riskPosterior(net, -1, river)));
-      }
-      const fs = floodStats(w, depth);
-      const stats = { rain: 0, floodedKm2: fs.floodedKm2, blocked: es.blocked, degraded: es.degraded, maxDepth: fs.maxDepth };
-      updateFigures(stats);
-      // Which neighbourhoods can still reach a relief centre (debounced: one
-      // shortest-path search per centre, so not on every slider pixel).
-      if (cutTimer) clearTimeout(cutTimer);
-      const at = level;
-      cutTimer = setTimeout(() => {
-        cutTimer = null;
-        if (signal.aborted || mode !== 'level' || !world || !table || at !== level) return;
-        const prep = prepareNetwork(world, level, travel, table);
-        let people = 0;
-        const hoods = new Set<string>();
-        for (const g of allGroups(world)) {
-          const ok = g.node >= 0 && prep.timeTo.some((t, s) => !prep.centreFlooded[s] && Number.isFinite(t[g.node]));
-          if (!ok) {
-            people += g.size;
-            hoods.add(world.hoods[g.hood].name);
-          }
-        }
-        levelCut = { people, hoods: [...hoods] };
-        updateFigures(stats);
-      }, 160);
-    }
-
-    function startClient(w: World) {
       client?.dispose();
       const c = new FloodClient();
       client = c;
-      stage = [];
-      lastState = null;
-      lastMinute = -1;
-      floodedSubways.clear();
-      duration = resolveStorm(sp).duration;
-      scrubber.setDuration(duration);
-      scrubber.setHydrograph(rainSeries(resolveStorm(sp), 240));
+      // The storm of 26 July 2005, exactly as recorded.
+      const sp = { ...DEFAULT_SCENARIO };
+      const gaugeCell = pickGaugeCell(w);
       c.on('frame', onFrame);
-      c.on('routes', (r) => {
-        agentLayer.setRoutes(r.ids, r.offsets, r.nodes);
-        map.requestRender();
-      });
-      c.on('series', (s) => {
-        for (let i = 0; i < s.stage.length; i++) stage[s.from + i] = s.stage[i];
-        drawHydrograph();
-      });
-      c.on('seriesTruncate', ({ keep }) => {
-        stage.length = Math.min(stage.length, keep);
-        drawHydrograph();
-      });
       c.on('busy', ({ at, target }) => {
         status.hidden = false;
-        status.textContent = `Computing ${fmtClock(at)} of ${fmtClock(target)}`;
+        status.textContent = `Going back: ${fmtClock(at)} of ${fmtClock(target)}`;
       });
-      c.on('error', ({ message, fatal }) => {
-        log(message);
-        if (fatal) {
-          status.hidden = false;
-          status.replaceChildren(h('span', null, `${message} `), restartSimBtn);
-          setPlaying(false);
-        }
+      c.on('error', ({ message }) => {
+        status.hidden = false;
+        status.textContent = message;
       });
-      const setup = buildFloodSetup(w);
-      const notLand = new Uint8Array(w.terrain.n * w.terrain.n);
-      for (let k = 0; k < notLand.length; k++) notLand[k] = w.sea[k] || w.terrain.channel[k] ? 1 : 0;
-      agentLayer.clear();
-      selectedGroup = -1;
-      lastReplans = 0;
-      announcedDone = false;
-      const gaugeCell = pickGaugeCell(w);
-      riskSetup = buildRiskSetup(w, sp.seed, gaugeCell);
-      lastRisk = null;
-      const agents = buildAgentSetup(w, strategy, travel, 2, sp.seed);
-      groupSpecs = agents.groups;
-      assignSeen.clear();
-      c.send({ type: 'init', setup, forcing: buildForcing(sp), edges: table!, ground: w.ground, gaugeCell, mode: travel, notLand, agents, risk: riskSetup });
-      if (sp.rainScale !== 1) c.send({ type: 'rain', scale: sp.rainScale });
-      renderStormInfo();
+      c.send({ type: 'init', setup: buildFloodSetup(w), forcing: buildForcing(sp), edges: table, ground: w.ground, gaugeCell, mode: 'vehicle', notLand: notLand(w) });
+      setPlaying(false);
+      journey = null;
     }
-    const restartSimBtn = h('button', { class: 'btn btn-primary', type: 'button', style: 'pointer-events: auto' }, 'Restart simulation');
-    restartSimBtn.addEventListener('click', () => {
-      status.hidden = true;
-      if (world) startClient(world);
-    });
 
-    function drawHydrograph() {
-      const n = 240;
-      const line = new Float32Array(n).fill(NaN);
-      for (let i = 0; i < n; i++) {
-        const m = Math.round((i / (n - 1)) * duration);
-        if (stage[m] !== undefined) line[i] = stage[m];
+    /** One button: start, pause, resume, or (after arriving) run again. */
+    function run() {
+      if (!client || start < 0 || goal < 0) return;
+      if (journey?.status === 'arrived') {
+        resetTrip(null, true);
+        return;
       }
-      scrubber.setHydrograph(rainSeries(resolveStorm(sp), n), line);
+      if (holding) {
+        clearTimeout(holding);
+        holding = null;
+      }
+      if (playing) client.send({ type: 'pause' });
+      else {
+        client.send({ type: 'play', speed: Number(speed) });
+        if (minute === 0) announce('Storm started.');
+      }
     }
 
-    function restartSim() {
+    /** Back to t+00:00 with the current trip and settings; optionally start playing. */
+    function resetTrip(reason: string | null, play = false) {
       syncURL();
-      events.length = 0;
-      eventsList.replaceChildren();
-      setPlaying(false);
-      if (world) startClient(world);
-      if (mode === 'level') client?.send({ type: 'pause' });
+      if (holding) {
+        clearTimeout(holding);
+        holding = null;
+      }
+      journey = null;
+      anim = null;
+      logLines.length = 0;
+      if (reason) log(0, `${reason}. The trip was planned again from t+00:00.`);
+      renderTrip();
+      if (!client) return;
+      client.send({ type: 'pause' });
+      client.send({ type: 'seek', minute: 0 });
+      if (play) client.send({ type: 'play', speed: Number(speed) });
     }
 
-    function reloadWorld() {
-      const token = ++genToken;
-      status.hidden = false;
-      status.textContent = 'Loading the Mumbai map';
-      setPlaying(false);
-      client?.dispose();
-      client = null;
-      loadMumbai({ ...DEFAULT_MUMBAI, gridSize: gridFor(quality()) }).then(
-        (w) => {
-          if (token !== genToken || signal.aborted) return;
-          world = w;
-          table = buildEdgeTable(w);
-          map.setWorld(w);
-          renderCity(w);
-          showInspector(null);
-          startClient(w);
-          status.hidden = true;
-          if (mode === 'level') applyLevel();
-          announce(`Map loaded: ${w.title}. ${w.hoods.length} neighbourhoods, ${w.graph.edges.length} road segments.`);
-        },
-        (err) => {
-          if (token !== genToken) return;
-          status.hidden = false;
-          status.textContent = `The map could not be loaded: ${err instanceof Error ? err.message : String(err)}. Check your connection and reload.`;
-        },
+    function setPlaying(p: boolean) {
+      playing = p;
+      runBtn.textContent = journey?.status === 'arrived' ? 'Run the storm again' : p ? 'Pause' : holding ? 'Continue' : minute > 0 ? 'Resume the storm' : 'Start the storm';
+      map.setAnimating(p || !!anim);
+    }
+
+    function onFrame(f: FrameMsg) {
+      if (signal.aborted) return;
+      minute = f.minute;
+      status.hidden = true;
+      map.setDepth(f.depth, f.flow, { reset: true, intervalMs: 0 });
+      map.setEdgeState(f.edgeState);
+      map.setRain(clamp(f.stats.rain / 120, 0, 1));
+      cond = { state: f.edgeState, depth: f.edgeDepth, risk: f.edgeRisk, lambda: 0 };
+      if (net && start >= 0 && goal >= 0 && start !== goal) {
+        if (!journey || f.minute < jMinute) {
+          journey = new Journey(net, start, goal, leaveAt, algo);
+          jMinute = f.minute;
+          handle(journey.step(f.minute, 0, cond));
+        } else if (f.minute > jMinute) {
+          const dt = f.minute - jMinute;
+          jMinute = f.minute;
+          handle(journey.step(f.minute, dt, cond));
+        }
+      }
+      updateClock(f);
+      renderRoutes();
+      setPlaying(f.playing);
+      map.requestRender();
+      requestAnimationFrame(() => client?.send({ type: 'ack' }));
+    }
+
+    /** Turn journey events into map marks, log lines and pauses. */
+    function handle(events: JourneyEvent[]) {
+      for (const e of events) {
+        const when = e.minute;
+        switch (e.kind) {
+          case 'plan': {
+            const p = e.plan;
+            showSearch(p);
+            if (!p.best) {
+              log(when, e.reason === 'start' ? `No route exists from ${startName} to ${goalName} right now: every way is closed.` : 'No open route is left from here. The car waits for the water to drop.', true);
+              break;
+            }
+            const b = p.best;
+            if (e.reason === 'start') log(when, `${ALGO_NAMES[p.algo]} found the best route: ${fmtMinutes(b.minutes)}, ${fmtNum(b.km, 1)} km via ${b.via}. It explored ${fmtInt(p.expanded)} junctions.${p.alternatives.length ? ` Alternatives: ${p.alternatives.map((a, i) => `${'BC'[i]} ${fmtMinutes(a.minutes)} via ${a.via}`).join('; ')}.` : ''}`);
+            else if (e.reason === 'blocked') log(when, `Re-planned with ${ALGO_NAMES[p.algo]} from ${journey?.status === 'driving' ? 'the car\'s position' : 'the start'}: new route ${fmtMinutes(b.minutes)} via ${b.via} (${fmtInt(p.expanded)} junctions explored).`, true);
+            else if (e.reason === 'better') log(when, e.prev?.status === 'slow' ? `Water on the current route is slowing it down; switched to a drier route via ${b.via} (${fmtMinutes(b.minutes)}).` : `A clearly faster route opened: via ${b.via} (${fmtMinutes(b.minutes)}).`);
+            else log(when, `A road reopened: new route via ${b.via} (${fmtMinutes(b.minutes)}).`, true);
+            break;
+          }
+          case 'blocked': {
+            const what = roadName(e.edge);
+            const why = net!.kind[e.edge] === 'bridge' ? 'the river has risen above the bridge deck' : net!.kind[e.edge] === 'tunnel' ? 'the underpass has filled with water' : `${fmtNum(e.depth, 2)} m of water is over the road (cars stop at 0.30 m)`;
+            log(when, `${capital(what)} is closed: ${why}. The current route through it can no longer be used.`, true);
+            hold();
+            break;
+          }
+          case 'depart':
+            log(when, `The car leaves ${startName}.`);
+            break;
+          case 'turnback':
+            log(when, `${capital(roadName(e.edge))} flooded under the car; it turns back to the last junction.`, true);
+            break;
+          case 'pushon':
+            log(when, `${capital(roadName(e.edge))} flooded under the car, but it is nearly through, so it pushes on slowly.`);
+            break;
+          case 'stuck':
+            log(when, `Stuck: no open road leads to ${goalName}. ${journey?.status === 'planning' ? 'The trip cannot start until the water drops.' : 'The car waits at a junction and the planner tries again every minute.'}`, true);
+            break;
+          case 'arrive':
+            log(when, `Arrived at ${goalName} after ${fmtMinutes(e.tripMinutes)} on the road, with ${journey?.replans ?? 0} re-plan${journey?.replans === 1 ? '' : 's'}.`, true);
+            client?.send({ type: 'pause' });
+            announce(`Arrived after ${fmtMinutes(e.tripMinutes)}.`);
+            break;
+        }
+      }
+      renderLog();
+    }
+
+    /** Hold the storm briefly on a re-plan so people can see what happened. */
+    function hold() {
+      if (!playing || !client) return;
+      client.send({ type: 'pause' });
+      if (holding) clearTimeout(holding);
+      holding = setTimeout(() => {
+        holding = null;
+        if (!signal.aborted && journey?.status !== 'arrived') client?.send({ type: 'play', speed: Number(speed) });
+      }, HOLD_MS);
+    }
+
+    function roadName(e: number): string {
+      const n = net!;
+      const kind = n.kind[e] === 'bridge' ? 'bridge' : n.kind[e] === 'tunnel' ? 'underpass' : 'road';
+      return n.street[e] ? `${n.street[e]}${kind !== 'road' ? ` (${kind})` : ''}` : `an unnamed ${kind} (${n.code[e]})`;
+    }
+
+    // ── Explaining the search ──
+    function showSearch(p: PlanResult) {
+      if (!reduce()) {
+        anim = { nodes: p.explored, at: performance.now() };
+        map.setAnimating(true);
+      }
+      const a = ALGO_NAMES[p.algo];
+      const parts: HTMLElement[] = [];
+      parts.push(h('p', null, h('strong', null, `${a} explored ${fmtInt(p.expanded)} junctions`), ' to find this route (the dots that light up on the map, in the order it visited them).'));
+      if (p.algo === 'astar') {
+        const saving = p.ucsExpanded > 0 ? Math.round((1 - p.expanded / p.ucsExpanded) * 100) : 0;
+        parts.push(h('p', null, `Uniform Cost Search would explore ${fmtInt(p.ucsExpanded)} to find the same route. A* explores ${saving}% fewer because it adds the straight-line distance to the destination (divided by the fastest speed) to each junction's cost so far: f = g + h. It always tries the junction with the smallest f, so it heads towards the destination and never misses a faster route.`));
+      } else if (p.algo === 'ucs') {
+        parts.push(h('p', null, `Uniform Cost always expands the cheapest junction so far, in every direction, like a ripple. It finds the best route, but A* finds the same one exploring only ${fmtInt(p.astarExpanded)} junctions.`));
+      } else {
+        const worse = p.best && Number.isFinite(p.optimalCost) && p.optimalCost > 0 ? (p.best.cost - p.optimalCost) / p.optimalCost : 0;
+        const how = p.algo === 'greedy' ? 'Greedy Best-First only looks at the straight-line distance to the destination (h), not the time already spent (g), so it rushes towards the goal and can be led down slow roads.' : p.algo === 'bfs' ? 'Breadth-First counts road segments, not minutes, so it finds the route with the fewest segments, not the fastest.' : 'Depth-First follows one road as far as it can and returns the first route it stumbles into.';
+        parts.push(h('p', null, how, ' ', worse > 0.005 ? h('strong', null, `Its route is ${Math.round(worse * 100)}% slower than the best possible.`) : 'This time its route happens to be as good as the best one.', ` A* would explore ${fmtInt(p.astarExpanded)} junctions and always find the best route.`));
+      }
+      parts.push(h('p', { class: 'small muted' }, 'Alternatives B and C come from searching again with the roads of the earlier routes made more expensive, so the search prefers different roads.'));
+      searchNote.replaceChildren(...parts);
+    }
+
+    // ── Panels ──
+    function renderTrip() {
+      const w = world;
+      if (!w || start < 0 || goal < 0) {
+        tripLine.textContent = 'Choose a trip above, or tap the map: first the start, then the destination.';
+        updatePickNote();
+        return;
+      }
+      startName = placeName(start);
+      goalName = placeName(goal);
+      tripLine.replaceChildren(h('span', { class: 'trip-dot start' }), ` From ${startName} `, h('span', { class: 'trip-dot goal' }), ` to ${goalName}, leaving at ${fmtClock(leaveAt)}.`);
+      updatePickNote();
+      fitTrip();
+    }
+
+    function renderRoutes() {
+      const j = journey;
+      if (!j || !j.route) {
+        routesList.replaceChildren(h('li', null, j ? 'No open route right now.' : 'Choose a trip to see its routes.'));
+        return;
+      }
+      const cur = cond ? (j.status === 'driving' ? remaining(j) : j.route) : j.route;
+      const rows: HTMLElement[] = [];
+      rows.push(routeRow('A', cur, j.status === 'driving' ? 'the car is following it' : j.status === 'arrived' ? 'the route it took' : 'the planned route', 'best'));
+      j.alternatives.forEach((a, i) => rows.push(routeRow('BC'[i], a, a.status === 'blocked' ? 'closed by water' : `alternative, ${fmtMinutes(a.minutes - cur.minutes)} slower`, 'alt')));
+      for (const ab of j.abandoned.slice(-2)) rows.push(routeRow('×', ab.route, `given up at ${fmtClock(ab.minute)}: ${roadName(ab.edge)} closed`, 'dead'));
+      routesList.replaceChildren(...rows);
+    }
+
+    function remaining(j: Journey): RouteInfo {
+      const r = j.route!;
+      const from = j.pos > 0 ? j.i : j.i;
+      let minutes = 0, km = 0;
+      for (let k = from; k < r.edges.length; k++) {
+        const e = r.edges[k];
+        km += net!.length[e] / 1000;
+        const s = cond!.state[e];
+        minutes += s === 2 ? 0 : net!.length[e] / net!.speed[e] / 60;
+      }
+      return { ...r, minutes, km };
+    }
+
+    function routeRow(letter: string, r: RouteInfo, what: string, kind: 'best' | 'alt' | 'dead'): HTMLElement {
+      return h(
+        'li',
+        { class: `route-row ${kind}` },
+        h('span', { class: 'route-letter' }, letter),
+        h('span', null, h('strong', null, kind === 'dead' ? 'Old route' : `${fmtMinutes(r.minutes)} · ${fmtNum(r.km, 1)} km`), ` via ${r.via}`, h('br'), h('span', { class: 'small muted' }, `${what}${kind !== 'dead' && r.status === 'slow' ? '; water slows part of it' : ''}`)),
       );
     }
 
-    function showInspector(sel: Selection, speak = true) {
-      const w = world;
-      if (!w || !sel) {
-        inspectorBody.replaceChildren(h('p', { class: 'small muted' }, 'Tap a neighbourhood, road, bridge, subway or relief centre on the map.'));
-        return;
-      }
-      const rows: [string, string][] = [];
-      let title = '';
-      if (sel.kind === 'hood') {
-        const hd = w.hoods[sel.id];
-        title = hd.name;
-        rows.push(
-          ['Residents (estimate)', fmtInt(hd.residents)],
-          ['Likely to need shelter', fmtInt(hd.population)],
-          ['Mean elevation', `${fmtNum(hd.meanElev, 1)} m`],
-          ['Drainage', `${hd.drainageClass} (${fmtNum(hd.drainage, 2)})`],
-          ['Pick-up junction', hd.accessNode >= 0 ? `J${hd.accessNode}` : 'no road access'],
-          ['Facilities', [hd.hasHospital ? 'hospital' : '', hd.hasSchool ? 'school' : ''].filter(Boolean).join(', ') || 'none mapped'],
-        );
-        if (hoodDist) {
-          const o = sel.id * 3;
-          const evid = mode === 'storm' && lastRisk ? `, rain gauge ${RAIN_STATES[lastRisk.readings.rain]}, river gauge ${RIVER_STATES[lastRisk.readings.river]}` : mode === 'level' ? `, water at ${level.toFixed(1)} m` : '';
-          rows.push(
-            ['Flood risk, Bayes', `P(high) ${fmtNum(hoodDist[o + 2], 2)}`],
-            ['Low / medium / high', `${fmtNum(hoodDist[o], 2)} / ${fmtNum(hoodDist[o + 1], 2)} / ${fmtNum(hoodDist[o + 2], 2)}`],
-            ['Evidence', `${hd.drainageClass} drains, ${hd.meanElev < 5 ? 'low' : hd.meanElev < 9 ? 'mid' : 'high'} ground${evid}`],
-          );
-        }
-        // Where this neighbourhood's groups are going (storm mode).
-        const p = agentLayer.raw();
-        if (mode === 'storm' && p && groupSpecs.length * STRIDE === p.length) {
-          const per = new Map<number, number>();
-          let n = 0, safe = 0, none = 0;
-          groupSpecs.forEach((g, gi) => {
-            if (g.hood !== sel.id) return;
-            n++;
-            const o = gi * STRIDE, sh = p[o + 4];
-            if (p[o + 2] === Status.Sheltered) safe += g.size;
-            if (sh >= 0) per.set(sh, (per.get(sh) ?? 0) + g.size);
-            else none += g.size;
-          });
-          if (n) {
-            rows.push(['Evacuee groups', String(n)], ['In a centre now', fmtInt(safe)]);
-            const list = [...per].sort((a, b) => b[1] - a[1]).map(([sh, ppl]) => `S${sh + 1} ${fmtInt(ppl)}`);
-            rows.push([strategy === 'risk' ? 'Assigned centres' : 'Heading for', list.length ? list.join(', ') : 'not decided yet']);
-            if (none && per.size) rows.push(['No centre yet', fmtInt(none)]);
-          }
-        }
-      } else if (sel.kind === 'group') {
-        const gr = agentLayer.group(sel.id);
-        const spec = groupSpecs[sel.id];
-        const hoodName = spec ? w.hoods[spec.hood]?.name : undefined;
-        const k = spec ? groupSpecs.slice(0, sel.id + 1).filter((g) => g.hood === spec.hood).length : 0;
-        title = hoodName ? `${hoodName}, group ${k}` : `Evacuee group ${sel.id + 1}`;
-        if (gr) {
-          const statusWord = ['waiting to leave', 'on the move', 'in a relief centre', 'no reachable centre', 'waiting at a closed road', 'turning back from a flooded road', 'no road access'][gr.status] ?? 'unknown';
-          rows.push(['People', fmtInt(gr.size)], ['Status', statusWord]);
-          if (spec) rows.push(['Leaves at', fmtClock(spec.departAt)]);
-          rows.push([gr.status === Status.Sheltered ? 'In' : strategy === 'risk' ? 'Assigned centre' : 'Heading for', gr.shelter >= 0 ? w.shelters[gr.shelter].name : 'none yet']);
-          if (gr.status === Status.Sheltered && gr.arrivedAt >= 0) rows.push(['Arrived', fmtClock(gr.arrivedAt)]);
-          else if (gr.eta >= 0 && gr.shelter >= 0) rows.push(['Expected arrival', `${fmtClock(gr.eta)}${gr.eta > minute ? `, in ${fmtMinutes(gr.eta - minute)}` : ''} (free-flow estimate)`]);
-          rows.push(['Re-plans', String(gr.replans)]);
-        }
-      } else if (sel.kind === 'shelter') {
-        const s = w.shelters[sel.id];
-        title = s.name;
-        rows.push(['Capacity', `${fmtInt(s.capacity)} people`], ['Inside now', fmtInt(agentLayer.occupancyOf(s.id))], [strategy === 'naive' ? 'Heading here' : 'Booked, on the way or not left', fmtInt(agentLayer.bookedFor(s.id))], ['Elevation', `${fmtNum(s.elev, 1)} m`], ['Junction', `J${s.node}`], ['Ground', s.lowGround ? 'fairly low: may be cut off' : 'high']);
-      } else {
-        const e = w.graph.edges[sel.id];
-        const kindWord = { road: e.cls === 'arterial' ? 'main road' : 'road', bridge: 'bridge over water', flyover: 'flyover', tunnel: 'subway / underpass' }[e.kind];
-        title = e.street ? `${e.street}` : `${kindWord} ${e.name}`;
-        const st = lastFrame?.edgeState[e.id] ?? 0;
-        const dep = lastFrame?.edgeDepth[e.id] ?? 0;
-        rows.push(
-          ['Type', `${kindWord} (${e.name})`],
-          ['Now', ['open', 'flooded, slow', 'closed'][st] + (dep > 0.01 ? `, ${fmtNum(dep, 2)} m of water` : '')],
-          ['Length', `${fmtInt(e.length)} m`],
-          ['Free-flow speed', `${fmtInt(e.speed * 3.6)} km/h`],
-          ['Capacity', `${fmtInt(e.capacity)} veh/h`],
-          ['Lowest point', e.kind === 'flyover' ? 'elevated' : `${fmtNum(e.minElev, 1)} m`],
-        );
-        if (e.isBridge) rows.push(['Deck level', `${fmtNum(e.deckLevel, 1)} m`]);
-        if (mode === 'storm' && lastFrame?.risk) rows.push(['Flood risk P_flood', e.kind === 'flyover' ? '0 (elevated)' : fmtNum(lastFrame.edgeRisk[e.id] ?? 0, 2)]);
-      }
-      inspectorBody.replaceChildren(h('h3', { style: 'font-size: var(--step-1); margin-bottom: var(--s-3)' }, title), h('dl', { class: 'facts' }, ...rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])));
-      if (speak) announce(`Selected ${title}`);
+    function log(minute: number, text: string, strong = false) {
+      logLines.push({ minute, text, strong });
+      renderLog();
     }
 
-    // ── Wiring ──
-    stormGroup.hidden = mode !== 'storm';
-    levelGroup.hidden = mode !== 'level';
-    renderStormInfo();
-    reloadWorld();
+    function renderLog() {
+      logList.replaceChildren(...[...logLines].reverse().map((l) => h('li', { class: l.strong ? 'strong' : null }, h('span', { class: 'mono' }, fmtClock(l.minute)), ` ${l.text}`)));
+    }
 
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement;
-      if (e.key === ' ' && (t === document.body || t.classList.contains('map-input'))) {
-        e.preventDefault();
-        togglePlay();
+    function updateClock(f: FrameMsg) {
+      clockBig.textContent = fmtClock(f.minute);
+      clockLine.textContent = `${fmtInt(f.stats.rain)} mm/h rain · ${fmtInt(f.stats.blocked)} roads closed`;
+      const j = journey;
+      clockLine2.textContent = !j
+        ? 'Choose a trip'
+        : j.status === 'planning'
+          ? j.route
+            ? `Car leaves at ${fmtClock(leaveAt)} · planned route ${fmtMinutes(j.route.minutes)}`
+            : 'No open route from the start'
+          : j.status === 'driving'
+            ? `Driving · ${j.replans} re-plan${j.replans === 1 ? '' : 's'}`
+            : j.status === 'stuck'
+              ? 'Stuck: waiting for the water to drop'
+              : `Arrived at ${fmtClock(j.arrivedAt)} · ${j.replans} re-plan${j.replans === 1 ? '' : 's'}`;
+    }
+
+    function syncURL() {
+      const p: Record<string, string> = {};
+      if (algo !== 'astar') p.algo = algo;
+      if (leaveAt !== 120) p.leave = String(leaveAt);
+      replaceParams(p);
+    }
+
+    // ── Drawing ──
+    function draw(d: DrawCtx) {
+      const w = world, j = journey;
+      if (!w || !net) return;
+      const { ctx, cam, pal } = d;
+      const z = clamp(Math.sqrt(cam.zoom), 1, 2.4);
+      const pt = (v: number) => cam.toScreen(w.graph.nodes[v].x, w.graph.nodes[v].y);
+      const pathOf = (nodes: number[], from = 0) => {
+        const p = new Path2D();
+        for (let i = from; i < nodes.length; i++) {
+          const [x, y] = pt(nodes[i]);
+          if (i === from) p.moveTo(x, y);
+          else p.lineTo(x, y);
+        }
+        return p;
+      };
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      // 1. The search: explored junctions light up in order, then fade.
+      if (anim) {
+        const t = performance.now() - anim.at;
+        const shown = reduce() ? anim.nodes.length : Math.floor(anim.nodes.length * Math.min(1, t / REVEAL_MS));
+        const fade = t < REVEAL_MS ? 1 : 1 - (t - REVEAL_MS) / FADE_MS;
+        if (fade <= 0) anim = null;
+        else {
+          ctx.fillStyle = css(mix(pal.accent, pal.text, 0.55), 0.85 * fade);
+          for (let k = 0; k < shown; k++) {
+            const [x, y] = pt(anim.nodes[k]);
+            ctx.fillRect(x - 2.4 * z, y - 2.4 * z, 4.8 * z, 4.8 * z);
+          }
+          if (shown < anim.nodes.length && shown > 0) {
+            const [x, y] = pt(anim.nodes[shown - 1]);
+            ctx.beginPath();
+            ctx.arc(x, y, 7 * z, 0, Math.PI * 2);
+            ctx.strokeStyle = css(pal.text, 0.8);
+            ctx.lineWidth = 1.6;
+            ctx.stroke();
+          }
+          map.requestRender();
+        }
       }
-    };
-    document.addEventListener('keydown', onKey);
-    // Pause while the tab is hidden; resume when it returns.
-    const onVis = () => {
-      if (document.hidden) {
-        wasPlayingBeforeHide = playing;
-        if (playing) client?.send({ type: 'pause' });
-      } else if (wasPlayingBeforeHide) {
-        client?.send({ type: 'play', speed: Number(speed) });
-        wasPlayingBeforeHide = false;
+
+      if (j) {
+        // 2. Routes given up: crossed out where the road closed.
+        for (const ab of j.abandoned) {
+          const p = pathOf(ab.route.nodes);
+          ctx.strokeStyle = css(pal.background, 0.7);
+          ctx.lineWidth = 6 * z;
+          ctx.stroke(p);
+          ctx.setLineDash([7 * z, 6 * z]);
+          ctx.strokeStyle = css(pal.text, 0.8);
+          ctx.lineWidth = 3 * z;
+          ctx.stroke(p);
+          ctx.setLineDash([]);
+          blockMark(d, ab.edge, z, `${shortName(ab.edge)} closed`);
+        }
+        // 3. Alternatives, dashed and labelled.
+        j.alternatives.forEach((a, i) => {
+          const p = pathOf(a.nodes);
+          ctx.setLineDash([9 * z, 6 * z]);
+          ctx.strokeStyle = css(pal.background, 0.75);
+          ctx.lineWidth = 5.5 * z;
+          ctx.stroke(p);
+          ctx.strokeStyle = css(mix(pal.accent, pal.text, 0.5), a.status === 'blocked' ? 0.45 : 0.95);
+          ctx.lineWidth = 3.2 * z;
+          ctx.stroke(p);
+          ctx.setLineDash([]);
+          const mid = a.nodes[Math.floor(a.nodes.length * (0.4 + 0.15 * i))];
+          if (mid !== undefined) {
+            const [x, y] = pt(mid);
+            tag(ctx, pal, x, y, `${'BC'[i]} · ${a.status === 'blocked' ? 'closed' : fmtMinutes(a.minutes)}`, false);
+          }
+        });
+        // 4. The route being followed: driven part faint, the rest strong.
+        if (j.route && j.route.nodes.length > 1) {
+          const from = j.status === 'driving' ? j.i : 0;
+          if (from > 0) {
+            ctx.setLineDash([2 * z, 5 * z]);
+            ctx.strokeStyle = css(mix(pal.primary, pal.text, 0.3), 0.8);
+            ctx.lineWidth = 2.4 * z;
+            ctx.stroke(pathOf(j.route.nodes.slice(0, from + 1)));
+            ctx.setLineDash([]);
+          }
+          const rest = new Path2D();
+          const [cx, cy] = j.status === 'driving' ? cam.toScreen(...j.position()) : pt(j.route.nodes[0]);
+          rest.moveTo(cx, cy);
+          for (let i = from + 1; i < j.route.nodes.length; i++) {
+            const [x, y] = pt(j.route.nodes[i]);
+            rest.lineTo(x, y);
+          }
+          ctx.strokeStyle = css(pal.background, 0.9);
+          ctx.lineWidth = 10 * z;
+          ctx.stroke(rest);
+          ctx.strokeStyle = css(mix(pal.primary, pal.text, 0.2));
+          ctx.lineWidth = 5.5 * z;
+          ctx.stroke(rest);
+          const mid = j.route.nodes[Math.floor((from + j.route.nodes.length) / 2)];
+          if (mid !== undefined && j.status !== 'arrived') {
+            const [x, y] = pt(mid);
+            tag(ctx, pal, x, y, `A · ${fmtMinutes(j.status === 'driving' && cond ? remaining(j).minutes : j.route.minutes)}`, true);
+          }
+        }
       }
-    };
-    document.addEventListener('visibilitychange', onVis);
+
+      // 5. Start, destination and the car.
+      if (start >= 0) {
+        const [x, y] = pt(start);
+        ctx.beginPath();
+        ctx.arc(x, y, 9, 0, Math.PI * 2);
+        ctx.fillStyle = css(pal.text);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = css(pal.background);
+        ctx.fill();
+        tag(ctx, pal, x, y + 22, 'Start', false);
+      }
+      if (goal >= 0) {
+        const [x, y] = pt(goal);
+        ctx.beginPath();
+        ctx.arc(x, y, 15, 0, Math.PI * 2);
+        ctx.fillStyle = css(pal.background, 0.95);
+        ctx.fill();
+        ctx.lineWidth = 2.6;
+        ctx.strokeStyle = css(pal.text);
+        ctx.stroke();
+        ctx.strokeStyle = css(pal.text);
+        ctx.lineWidth = 2;
+        shelterGlyph(ctx, x, y, 7);
+        ctx.stroke();
+        tag(ctx, pal, x, y + 28, 'Destination', false);
+      }
+      if (j && j.status !== 'planning') {
+        const [x, y] = cam.toScreen(...j.position());
+        const pulse = d.reducedMotion ? 0 : 0.5 + 0.5 * Math.sin(d.time * 4);
+        ctx.beginPath();
+        ctx.arc(x, y, 13 + 4 * pulse, 0, Math.PI * 2);
+        ctx.strokeStyle = css(pal.text, 0.35 + 0.3 * pulse);
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x, y, 8, 0, Math.PI * 2);
+        ctx.fillStyle = css(pal.background);
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = css(pal.text);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = css(pal.text);
+        ctx.fill();
+        tag(ctx, pal, x + 20, y - 14, j.status === 'stuck' ? 'Car: stuck' : j.status === 'arrived' ? 'Car: arrived' : 'Car', true);
+      }
+      ctx.restore();
+    }
+
+    /** A closed road: a heavy cross in a hatched ring, and its name. */
+    function blockMark(d: DrawCtx, e: number, z: number, label: string) {
+      const w = world!;
+      const { ctx, cam, pal } = d;
+      const ed = w.graph.edges[e];
+      const A = w.graph.nodes[ed.a], B = w.graph.nodes[ed.b];
+      const [x, y] = cam.toScreen((A.x + B.x) / 2, (A.y + B.y) / 2);
+      const r = 11 * Math.min(z, 1.6);
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = css(pal.background);
+      ctx.fill();
+      ctx.clip();
+      ctx.strokeStyle = css(pal.text, 0.35);
+      ctx.lineWidth = 1;
+      for (let k = -2 * r; k < 2 * r; k += 4) {
+        ctx.beginPath();
+        ctx.moveTo(x + k - r, y - r);
+        ctx.lineTo(x + k + r, y + r);
+        ctx.stroke();
+      }
+      ctx.restore();
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.lineWidth = 2.2;
+      ctx.strokeStyle = css(pal.text);
+      ctx.stroke();
+      const k = r * 0.55;
+      ctx.beginPath();
+      ctx.moveTo(x - k, y - k);
+      ctx.lineTo(x + k, y + k);
+      ctx.moveTo(x + k, y - k);
+      ctx.lineTo(x - k, y + k);
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      tag(ctx, pal, x, y - r - 12, label, true);
+    }
+
+    function shortName(e: number): string {
+      const n = net!;
+      return n.street[e] || (n.kind[e] === 'bridge' ? `bridge ${n.code[e]}` : n.kind[e] === 'tunnel' ? `underpass ${n.code[e]}` : `road ${n.code[e]}`);
+    }
+
+    /** Fit the camera around the start and the destination. */
+    function fitTrip() {
+      const w = world;
+      if (!w || start < 0 || goal < 0) return;
+      const cam = map.camera;
+      if (cam.width < 50) {
+        setTimeout(fitTrip, 120);
+        return;
+      }
+      const A = w.graph.nodes[start], B = w.graph.nodes[goal];
+      const bw = Math.abs(A.x - B.x) + 2500, bh = Math.abs(A.y - B.y) + 2500;
+      cam.fit();
+      const fitScale = cam.scale;
+      cam.scale = clamp(Math.min(cam.width / bw, cam.height / bh), fitScale, fitScale * 6);
+      cam.cx = (A.x + B.x) / 2;
+      cam.cy = (A.y + B.y) / 2;
+      map.redraw();
+    }
+
+    // ── Load ──
+    const q = prefs.get().quality;
+    loadMumbai({ ...DEFAULT_MUMBAI, gridSize: q === 'high' ? 256 : q === 'low' ? 128 : 192 }).then(
+      (w) => {
+        if (signal.aborted) return;
+        world = w;
+        table = buildEdgeTable(w);
+        net = journeyNet(w, 'vehicle');
+        map.setWorld(w);
+        status.hidden = true;
+        startClient();
+        applyPreset(0);
+      },
+      (err) => {
+        status.textContent = `The map could not be loaded: ${err instanceof Error ? err.message : String(err)}`;
+      },
+    );
+    renderTrip();
+    renderRoutes();
+    searchNote.replaceChildren(h('p', { class: 'small muted' }, 'When a route is found, this explains how the algorithm searched for it.'));
 
     return () => {
-      document.removeEventListener('keydown', onKey);
-      document.removeEventListener('visibilitychange', onVis);
-      if (cutTimer) clearTimeout(cutTimer);
+      if (holding) clearTimeout(holding);
       client?.dispose();
       map.destroy();
-      scrubber.destroy();
       sheet.dispose();
     };
   },
 };
 
-function strategyWord(s: Strategy): string {
-  return { naive: 'naive static routing', dynamic: 'dynamic A* re-planning', risk: 'risk-aware A* with CSP + SA assignment' }[s];
+function notLand(w: World): Uint8Array {
+  const out = new Uint8Array(w.terrain.n * w.terrain.n);
+  for (let k = 0; k < out.length; k++) out[k] = w.sea[k] || w.terrain.channel[k] ? 1 : 0;
+  return out;
 }
 
-function listOf(items: string[]): string {
-  if (items.length <= 1) return items[0] ?? '';
-  if (items.length > 3) return `${items.slice(0, 3).join(', ')} and ${items.length - 3} more`;
-  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+function tag(ctx: CanvasRenderingContext2D, pal: Palette, x: number, y: number, text: string, strong: boolean) {
+  ctx.font = `${strong ? 600 : 500} 12px ${FONT_MONO}`;
+  ctx.textAlign = 'center';
+  ctx.lineWidth = 4;
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = css(pal.background, 0.95);
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = css(pal.text);
+  ctx.fillText(text, x, y);
+  ctx.textAlign = 'start';
 }
 
-function weakDevice(): boolean {
-  try {
-    const cores = navigator.hardwareConcurrency || 4;
-    const mem = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 4;
-    return cores <= 4 || mem <= 2;
-  } catch {
-    return false;
-  }
+function capital(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function legendItems(): HTMLElement[] {
+  const item = (svg: string, label: string) => h('li', null, h('span', { html: svg, 'aria-hidden': 'true' }), label);
+  return [
+    item(`<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="var(--background)" stroke-width="9"/><path d="M2 7h38" stroke="color-mix(in oklab, var(--primary) 80%, var(--text))" stroke-width="5" stroke-linecap="round"/></svg>`, 'A: the best route, the one being used'),
+    item(`<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="color-mix(in oklab, var(--accent) 70%, var(--text))" stroke-width="2.6" stroke-dasharray="7 5"/></svg>`, 'B, C: alternative routes'),
+    item(`<svg viewBox="0 0 42 14"><path d="M2 7h38" stroke="color-mix(in oklab, var(--text) 65%, var(--background))" stroke-width="2.4" stroke-dasharray="5 5"/><circle cx="21" cy="7" r="5.5" fill="var(--background)" stroke="var(--text)" stroke-width="1.8"/><path d="M18.3 4.3l5.4 5.4M23.7 4.3l-5.4 5.4" stroke="var(--text)" stroke-width="2"/></svg>`, 'A route given up, and the road that closed'),
+    item(`<svg viewBox="0 0 42 14"><rect x="10" y="3" width="3" height="3" fill="color-mix(in oklab, var(--accent) 65%, var(--text))"/><rect x="17" y="8" width="3" height="3" fill="color-mix(in oklab, var(--accent) 65%, var(--text))"/><rect x="25" y="4" width="3" height="3" fill="color-mix(in oklab, var(--accent) 65%, var(--text))"/></svg>`, 'Junctions the search explored'),
+    item(`<svg viewBox="0 0 42 14"><circle cx="21" cy="7" r="5" fill="var(--background)" stroke="var(--text)" stroke-width="2.2"/><circle cx="21" cy="7" r="2" fill="var(--text)"/></svg>`, 'The car'),
+  ];
 }
 
 export default page;

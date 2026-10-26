@@ -19,14 +19,11 @@ import { announce, h } from './ui/dom';
 import { buildShell, waterWipe } from './ui/layout';
 
 const routes: Record<string, PageLoader> = {
-  '/': () => import('./pages/home'),
+  // The site opens on the Simulator.
+  '/': () => import('./pages/simulator'),
   '/simulator': () => import('./pages/simulator'),
   '/algorithms': () => import('./pages/algorithms'),
   '/bayes': () => import('./pages/bayes'),
-  '/assignment': () => import('./pages/assignment'),
-  '/experiments': () => import('./pages/experiments'),
-  '/viva': () => import('./pages/viva'),
-  '/kit': () => import('./pages/kit'),
 };
 
 function boot(): void {
@@ -44,9 +41,9 @@ function boot(): void {
     fallback: '/',
     transition: (swap) => wipe(swap),
     onRoute(route, page) {
-      shell.setActive(route.path);
+      shell.setActive(route.path === '/' ? '/simulator' : route.path);
       document.title = route.path === '/' ? 'Floodline: dynamic flood evacuation planner' : `${page.title} | Floodline`;
-      document.body.dataset.route = route.path.slice(1) || 'home';
+      document.body.dataset.route = route.path.slice(1) || 'simulator';
       if (!first) {
         // Move focus to the new content for keyboard and screen-reader users.
         main.focus({ preventScroll: true });

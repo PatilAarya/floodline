@@ -9,7 +9,7 @@
  */
 import { astar } from '../ai/search/astar';
 import { bfs } from '../ai/search/bfs';
-import { graphOf, makeCost, makeHeuristic, maxSpeed, riskFromDepth } from '../ai/search/cost';
+import { graphOf, makeCost, makeHeuristic, maxSpeed } from '../ai/search/cost';
 import { dfs } from '../ai/search/dfs';
 import { greedy } from '../ai/search/greedy';
 import type { SearchEvent, SearchGraph, SearchProblem, SearchResult } from '../ai/search/types';
@@ -80,8 +80,8 @@ const page: Page = {
     let start = -1, goal = -1;
     let picking: 'start' | 'goal' = 'start';
     let level = parseClamped(query.get('level'), 0, 0, 6);
-    let travel: TravelMode = query.get('travel') === 'foot' ? 'foot' : 'vehicle';
-    let lambda = parseClamped(query.get('lambda'), 0, 0, 5);
+    // Cars: roads close at 30 cm of water.
+    const travel: TravelMode = 'vehicle';
     let showBad = query.get('bad') === '1';
     let rate = 12;
     let recordings: Partial<Record<AlgoId, Recording>> = {};
@@ -129,29 +129,6 @@ const page: Page = {
         syncURL();
       },
     });
-    const lambdaSlider = createSlider({
-      label: 'Risk weight lambda',
-      min: 0, max: 5, step: 0.5, value: lambda,
-      format: (v) => (v === 0 ? '0 (fastest route)' : v.toFixed(1)),
-      onChange: (v) => {
-        lambda = v;
-        clearRace();
-        syncURL();
-      },
-    });
-    const travelCtl = createSegmented<TravelMode>({
-      label: 'Travel',
-      value: travel,
-      options: [
-        { value: 'vehicle', label: 'By vehicle' },
-        { value: 'foot', label: 'On foot' },
-      ],
-      onChange: (m) => {
-        travel = m;
-        applyFlood();
-        syncURL();
-      },
-    });
     const badToggle = createToggle({
       label: `Add A* with a bad heuristic (h x ${INFLATE})`,
       value: showBad,
@@ -182,8 +159,8 @@ const page: Page = {
       'div',
       { class: 'algo-controls' },
       h('div', null, presetCtl.el, pickNote),
-      h('div', null, levelSlider.el, travelCtl.el),
-      h('div', null, lambdaSlider.el, badToggle.el),
+      h('div', null, levelSlider.el),
+      h('div', null, badToggle.el),
       h('div', null, speedCtl.el, h('div', { class: 'cluster', style: 'margin-top: var(--s-3)' }, raceBtn, resetBtn)),
     );
 
@@ -244,8 +221,6 @@ const page: Page = {
     function syncURL() {
       const p: Record<string, string> = {};
       if (level > 0) p.level = String(level);
-      if (travel === 'foot') p.travel = 'foot';
-      if (lambda > 0) p.lambda = String(lambda);
       if (showBad) p.bad = '1';
       replaceParams(p);
     }
@@ -313,8 +288,7 @@ const page: Page = {
 
     function problem(algo: AlgoInfo): SearchProblem {
       const w = world!, g = graph!;
-      const risk = depthOver ? riskFromDepth(depthOver, travel) : undefined;
-      const cost = makeCost(w, { mode: travel, state, depth: depthOver, risk, lambda });
+      const cost = makeCost(w, { mode: travel, state, depth: depthOver });
       const vmax = maxSpeed(w, travel);
       const p: SearchProblem = { graph: g, start, goal, cost };
       if (algo.usesH) p.heuristic = makeHeuristic(g, goal, vmax, algo.id === 'bad' ? INFLATE : 1);

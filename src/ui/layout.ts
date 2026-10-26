@@ -15,9 +15,6 @@ export const NAV: NavItem[] = [
   { path: '/simulator', label: 'Simulator' },
   { path: '/algorithms', label: 'Algorithms' },
   { path: '/bayes', label: 'Bayes' },
-  { path: '/assignment', label: 'Assignment' },
-  { path: '/experiments', label: 'Experiments' },
-  { path: '/viva', label: 'Viva' },
 ];
 
 export interface Shell {

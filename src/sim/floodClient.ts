@@ -5,12 +5,11 @@
  * reported so the page can offer a restart.
  */
 import { Emitter } from '../core/store';
-import { FloodEngine, type FrameMsg, type InMsg, type OutMsg, type RoutesMsg } from './floodEngine';
+import { FloodEngine, type FrameMsg, type InMsg, type OutMsg } from './floodEngine';
 
 type Events = {
   ready: { duration: number };
   frame: FrameMsg;
-  routes: RoutesMsg;
   series: { from: number; stage: Float32Array; flooded: Float32Array };
   seriesTruncate: { keep: number };
   busy: { target: number; at: number };
@@ -62,9 +61,6 @@ export class FloodClient extends Emitter<Events> {
         break;
       case 'frame':
         this.emit('frame', m);
-        break;
-      case 'routes':
-        this.emit('routes', m);
         break;
       case 'series':
         this.emit('series', m);

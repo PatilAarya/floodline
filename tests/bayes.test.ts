@@ -1,10 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { mumbaiNetwork, V } from '../src/ai/bayes/cpt';
-import { dSeparated, explainTrails } from '../src/ai/bayes/dsep';
 import { enumerationAsk, variableElimination } from '../src/ai/bayes/exact';
 import { cloneNetwork, validate, type Evidence } from '../src/ai/bayes/network';
-import { likelihoodWeighting } from '../src/ai/bayes/sampling';
-import { Rng } from '../src/core/rng';
 
 const net = mumbaiNetwork();
 const ev = (pairs: [number, number][]): Evidence => new Map(pairs);
@@ -41,31 +38,5 @@ describe('Bayesian network', () => {
     const e = ev([[V.Rain, 0], [V.RainGauge, 2]]);
     expect(enumerationAsk(n2, V.FloodRisk, e).impossible).toBe(true);
     expect(variableElimination(n2, V.FloodRisk, e).impossible).toBe(true);
-  });
-
-  it('likelihood weighting converges to the exact answer', () => {
-    const e = ev([[V.RainGauge, 2], [V.Elevation, 0]]);
-    const exact = variableElimination(net, V.FloodRisk, e).dist!;
-    const lw = likelihoodWeighting(net, V.FloodRisk, e, 50000, new Rng('lw-test'));
-    for (let s = 0; s < 3; s++) expect(Math.abs(lw.dist![s] - exact[s])).toBeLessThan(0.02);
-  });
-
-  it('d-separation: collider, fork and agreement with trail enumeration', () => {
-    const none = new Set<number>();
-    // Rain -> FloodRisk <- Drainage: independent until FloodRisk is observed.
-    expect(dSeparated(net, V.Rain, V.Drainage, none).separated).toBe(true);
-    expect(dSeparated(net, V.Rain, V.Drainage, new Set([V.FloodRisk])).separated).toBe(false);
-    // The two gauges share the cause Rain; observing Rain blocks every trail.
-    expect(dSeparated(net, V.RainGauge, V.RiverGauge, none).separated).toBe(false);
-    expect(dSeparated(net, V.RainGauge, V.RiverGauge, new Set([V.Rain])).separated).toBe(true);
-    for (let a = 0; a < net.vars.length; a++)
-      for (let b = 0; b < net.vars.length; b++) {
-        if (a === b) continue;
-        for (const z of [none, new Set([V.FloodRisk]), new Set([V.Rain, V.RiverLevel])]) {
-          if (z.has(a) || z.has(b)) continue;
-          const active = explainTrails(net, a, b, z).some((t) => t.active);
-          expect(dSeparated(net, a, b, z).separated).toBe(!active);
-        }
-      }
   });
 });

@@ -37,6 +37,9 @@ export default defineConfig({
     target: 'es2022',
     assetsInlineLimit: 0,
   },
+  preview: {
+    allowedHosts: ['.trycloudflare.com'],
+  },
   worker: {
     format: 'es',
   },
