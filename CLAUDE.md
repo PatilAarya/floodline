@@ -52,7 +52,7 @@ src/sim       floodModel floodEngine floodWorker floodClient hydrology rainfall 
 src/ai/search bfs dfs ucs greedy astar cost types replanner
 src/ai/bayes  network cpt exact
 src/render    gl/ canvas/ theme camera
-src/ui        layout mapView sheet dom glyphs controls/ charts/bars
+src/ui        layout mapView sheet dom glyphs searchDemo controls/ charts/bars
 src/pages     simulator algorithms bayes
 src/styles    tokens base type layout motion
 tests/  scripts/  DEPLOY.md  README.md

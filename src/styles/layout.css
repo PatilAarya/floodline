@@ -382,3 +382,15 @@ body[data-route="simulator"] { overflow: hidden; }
 .journey-log li { color: var(--text); }
 .journey-log li .mono { color: var(--muted); margin-right: 0.3em; }
 .journey-log li.strong { font-weight: 600; border-left: 3px solid var(--text); padding-left: var(--s-2); }
+
+/* ── Simulator: the animated grid explaining each search algorithm ── */
+.search-demo { margin-top: var(--s-2); }
+.demo-canvas { display: block; width: 100%; height: auto; }
+.demo-key { font-size: 0.8rem; color: var(--muted); margin: var(--s-2) 0; line-height: 1.8; }
+.demo-key span { display: inline-block; width: 0.95em; height: 0.95em; vertical-align: -0.12em; margin-right: 0.25em; }
+.demo-key .k-start, .demo-key .k-goal { width: auto; height: auto; font-weight: 700; color: var(--text); margin-right: 0.15em; }
+.demo-key .k-deep { background: color-mix(in oklab, var(--primary) 55%, var(--text)); }
+.demo-key .k-shallow { background: repeating-linear-gradient(135deg, color-mix(in oklab, var(--secondary) 60%, var(--text)) 0 1px, color-mix(in oklab, var(--secondary) 55%, var(--background)) 1px 4px); }
+.demo-key .k-seen { background: color-mix(in oklab, var(--accent) 55%, var(--background)); }
+.demo-caption { font-size: var(--step--1); margin: var(--s-2) 0; }
+.demo-facts { font-size: 0.82rem; color: var(--muted); margin: 0 0 var(--s-2); }

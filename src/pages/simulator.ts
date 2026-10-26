@@ -30,6 +30,7 @@ import { createSegmented } from '../ui/controls/segmented';
 import { createSlider } from '../ui/controls/slider';
 import { announce, h } from '../ui/dom';
 import { createMapView } from '../ui/mapView';
+import { createSearchDemo } from '../ui/searchDemo';
 import { makeSheet } from '../ui/sheet';
 import { DEFAULT_MUMBAI } from '../world/mumbai';
 import type { World } from '../world/types';
@@ -125,7 +126,7 @@ const page: Page = {
     });
 
     // ── Rail: the storm ──
-    const runBtn = h('button', { class: 'btn btn-primary btn-large', type: 'button' }, 'Start the storm');
+    const runBtn = h('button', { class: 'btn btn-primary btn-large', type: 'button' }, 'Start the flood');
     const resetBtn = h('button', { class: 'btn', type: 'button' }, 'Back to t+00:00');
     runBtn.addEventListener('click', () => run());
     resetBtn.addEventListener('click', () => resetTrip(null));
@@ -146,6 +147,8 @@ const page: Page = {
     // ── Rail: results ──
     const routesList = h('ul', { class: 'route-list' });
     const searchNote = h('div', { class: 'search-note' });
+    // The same search on a small grid, animated: shows how each algorithm explores.
+    const demo = createSearchDemo();
     const logList = h('ol', { class: 'notes journey-log', 'aria-live': 'polite' });
 
     const rail = h(
@@ -170,7 +173,7 @@ const page: Page = {
         leaveSlider.el,
         speedCtl.el,
       ),
-      h('section', { class: 'rail-section' }, h('h2', null, 'How the route was found'), searchNote),
+      h('section', { class: 'rail-section' }, h('h2', null, 'How the route was found'), searchNote, demo.el),
       h('section', { class: 'rail-section' }, h('h2', null, 'Journey'), logList),
     );
     root.append(h('h1', { class: 'visually-hidden' }, 'Simulator: one trip through the flood'), h('div', { class: 'map-layout' }, mapWrap, rail));
@@ -310,7 +313,7 @@ const page: Page = {
 
     function setPlaying(p: boolean) {
       playing = p;
-      runBtn.textContent = journey?.status === 'arrived' ? 'Run the storm again' : p ? 'Pause' : holding ? 'Continue' : minute > 0 ? 'Resume the storm' : 'Start the storm';
+      runBtn.textContent = journey?.status === 'arrived' ? 'Run the flood again' : p ? 'Pause' : holding ? 'Continue' : minute > 0 ? 'Resume the flood' : 'Start the flood';
       map.setAnimating(p || !!anim);
     }
 
@@ -426,6 +429,7 @@ const page: Page = {
       }
       parts.push(h('p', { class: 'small muted' }, 'Alternatives B and C come from searching again with the roads of the earlier routes made more expensive, so the search prefers different roads.'));
       searchNote.replaceChildren(...parts);
+      demo.play(p.algo);
     }
 
     // ── Panels ──
@@ -757,6 +761,7 @@ const page: Page = {
     return () => {
       if (holding) clearTimeout(holding);
       client?.dispose();
+      demo.destroy();
       map.destroy();
       sheet.dispose();
     };

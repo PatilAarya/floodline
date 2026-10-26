@@ -58,6 +58,7 @@ To share without deploying: `npm run build`, `npx vite preview --port 4173`, the
 
 ### Rendering and UI
 - `src/ui/mapView.ts` (WebGL base + 2D static + 2D dynamic canvases, camera controls, `hint`, `drawExtra`, `onTap`, `redraw`), `src/render/gl/floodGL.ts` + shaders, `src/render/canvas/` (roads, overlays, labels, terrain/water fallback).
+- `src/ui/searchDemo.ts`: the animated grid under "How the route was found" (17 x 9: S, G, a deep-water wall with a gap straight ahead and one at the bottom, a band of shallow water costing 3). Runs the real search functions and lights squares in expansion order, then draws the route. Results: BFS 14 steps cost 24, DFS and Greedy cost 24 (15 explored), UCS cost 22 (124 explored), A* cost 22 (94 explored). (A later experiment replacing the storm with a rising water level, travel modes and no departure/speed controls was reverted at the user's request; only this explainer was kept.)
 - Controls `src/ui/controls/{slider,toggle,segmented}.ts`, `src/ui/sheet.ts` (bottom sheet <= 1024 px), `src/ui/charts/bars.ts` (Algorithms page).
 
 ### Tests (`tests/`)
